@@ -2,21 +2,23 @@
 //! and the out-of-band reset (conformance/README.md, "write/close_write are
 //! serialized per stream id; reset runs out-of-band").
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::poll_fn;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use ws_mixer::{ConnId, ErrorCode, Stream, StreamError, StreamId};
 
 use crate::emit::{ack, cmd_error, emit, t_ms};
+use crate::lock;
 
 /// Bound of each stream's write/close_write queue.
 const QUEUE_CAP: usize = 64;
@@ -26,10 +28,9 @@ const QUEUE_CAP: usize = 64;
 const STREAM_WAIT: Duration = Duration::from_secs(5);
 /// Poll period for a RESET that arrives after read EOF (see `watch_late_reset`).
 const LATE_RESET_POLL: Duration = Duration::from_millis(10);
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
-}
+/// How long `reset` waits for the aborted queue's worker before acking, so
+/// the write the RESET unblocked reports its error first (as Go does).
+const RESET_DRAIN: Duration = Duration::from_secs(1);
 
 /// One app-visible stream. The `Stream` sits behind a std mutex so the
 /// reader, the FIFO worker and `reset` can share it: every access is a
@@ -79,9 +80,11 @@ impl Cell {
     }
 }
 
+/// Dropping it ends the worker once the jobs already queued are done.
 struct Queue {
     tx: mpsc::Sender<Job>,
     aborted: Arc<AtomicBool>,
+    worker: JoinHandle<()>,
 }
 
 struct Job {
@@ -96,6 +99,10 @@ pub enum Op {
 
 pub struct Streams {
     live: Mutex<HashMap<StreamId, Arc<Cell>>>,
+    /// Ids retired since the last connection ended: a command naming one
+    /// fails at once instead of waiting `STREAM_WAIT`. Cleared when a
+    /// connection ends, since the next one may reuse ids.
+    retired: Mutex<HashSet<StreamId>>,
     /// Bumped on every registration, to wake `wait`.
     registered: watch::Sender<u64>,
     queues: Mutex<HashMap<StreamId, Queue>>,
@@ -105,6 +112,7 @@ impl Streams {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             live: Mutex::new(HashMap::new()),
+            retired: Mutex::new(HashSet::new()),
             registered: watch::Sender::new(0),
             queues: Mutex::new(HashMap::new()),
         })
@@ -121,17 +129,24 @@ impl Streams {
             halves: Mutex::new((false, false)),
         });
         // A reconnect may reuse an id; the newest stream wins.
-        lock(&self.live).insert(cell.id, cell.clone());
+        {
+            let mut live = lock(&self.live);
+            live.insert(cell.id, cell.clone());
+            lock(&self.retired).remove(&cell.id);
+        }
         self.registered.send_modify(|g| *g += 1);
         emit(json!({"event": "stream_opened", "id": cell.id}));
         tokio::spawn(self.clone().read_loop(cell));
     }
 
-    /// Forgets `cell` if it is still the registered stream for its id.
+    /// Forgets `cell` and its queue if it is still the registered stream for
+    /// its id.
     fn retire(&self, cell: &Arc<Cell>) {
         let mut live = lock(&self.live);
         if live.get(&cell.id).is_some_and(|c| Arc::ptr_eq(c, cell)) {
             live.remove(&cell.id);
+            lock(&self.retired).insert(cell.id);
+            lock(&self.queues).remove(&cell.id);
         }
     }
 
@@ -143,16 +158,35 @@ impl Streams {
 
     /// Forgets every stream of a connection that ended. Their readers see
     /// `ConnectionLost` (or are already parked on EOF) and stop on their own.
+    /// `None` (a dial that never got a connection) has no streams.
     pub fn conn_ended(&self, conn: Option<ConnId>) {
-        lock(&self.live).retain(|_, c| conn.is_some_and(|id| c.conn != id));
+        let Some(conn) = conn else { return };
+        let mut live = lock(&self.live);
+        let mut queues = lock(&self.queues);
+        live.retain(|id, c| {
+            let keep = c.conn != conn;
+            if !keep {
+                queues.remove(id);
+            }
+            keep
+        });
+        lock(&self.retired).clear();
     }
 
+    /// The stream registered as `id`, waiting up to `STREAM_WAIT` for one
+    /// not seen yet. `None` at once for an id already retired.
     async fn wait(&self, id: StreamId) -> Option<Arc<Cell>> {
         let mut rx = self.registered.subscribe();
         let deadline = tokio::time::Instant::now() + STREAM_WAIT;
         loop {
-            if let Some(c) = lock(&self.live).get(&id) {
-                return Some(c.clone());
+            {
+                let live = lock(&self.live);
+                if let Some(c) = live.get(&id) {
+                    return Some(c.clone());
+                }
+                if lock(&self.retired).contains(&id) {
+                    return None;
+                }
             }
             match tokio::time::timeout_at(deadline, rx.changed()).await {
                 Ok(Ok(())) => {}
@@ -238,8 +272,12 @@ impl Streams {
         let q = queues.entry(id).or_insert_with(|| {
             let (tx, rx) = mpsc::channel(QUEUE_CAP);
             let aborted = Arc::new(AtomicBool::new(false));
-            tokio::spawn(self.clone().worker(id, rx, aborted.clone()));
-            Queue { tx, aborted }
+            let worker = tokio::spawn(self.clone().worker(id, rx, aborted.clone()));
+            Queue {
+                tx,
+                aborted,
+                worker,
+            }
         });
         match q.tx.try_send(Job { seq, op }) {
             Ok(()) => {}
@@ -298,17 +336,32 @@ impl Streams {
         }
     }
 
-    /// RESET, out of band: aborts whatever is still queued for the stream,
-    /// then resets it, which also fails a write blocked on credit.
-    pub async fn reset(&self, seq: Value, id: StreamId, code: u32, message: String) {
-        if let Some(q) = lock(&self.queues).remove(&id) {
-            q.aborted.store(true, Ordering::Release);
-        }
+    /// First half of RESET, run synchronously on the stdin loop: aborts
+    /// whatever is still queued for `id` and returns that queue's worker.
+    pub fn abort_queue(&self, id: StreamId) -> Option<JoinHandle<()>> {
+        let q = lock(&self.queues).remove(&id)?;
+        q.aborted.store(true, Ordering::Release);
+        Some(q.worker)
+    }
+
+    /// RESET, out of band: resets the stream, which also fails a write
+    /// blocked on credit, and lets `worker` report that before the ack.
+    pub async fn reset(
+        &self,
+        seq: Value,
+        id: StreamId,
+        code: u32,
+        message: String,
+        worker: Option<JoinHandle<()>>,
+    ) {
         let Some(cell) = self.wait(id).await else {
             cmd_error(&seq, format!("reset: no such stream {id}"));
             return;
         };
         lock(&cell.stream).reset(ErrorCode(code), &message);
+        if let Some(w) = worker {
+            let _ = tokio::time::timeout(RESET_DRAIN, w).await;
+        }
         ack(&seq);
     }
 }

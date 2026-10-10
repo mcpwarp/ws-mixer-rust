@@ -570,7 +570,7 @@ async fn retry_after_is_honoured() {
     let mut r = base_reason(Some(d.conn_id), Phase::Dial, "HTTP 429".into());
     r.http_status = Some(429);
     d.fail(ConnFailure {
-        reason: r,
+        reason: Box::new(r),
         retry_after: Some(S * 42),
         welcome_timeout: false,
     });

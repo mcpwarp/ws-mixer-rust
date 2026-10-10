@@ -100,7 +100,8 @@ impl ConnConfig {
 /// A failed dial or handshake.
 #[derive(Clone, Debug)]
 pub(crate) struct ConnFailure {
-    pub(crate) reason: DisconnectReason,
+    /// Boxed to keep `Result<_, ConnFailure>` small (`clippy::result_large_err`).
+    pub(crate) reason: Box<DisconnectReason>,
     /// `Retry-After` of an HTTP 429 or 503 upgrade response.
     pub(crate) retry_after: Option<Duration>,
     /// Our own welcome timeout: the locally generated `4001` that WIRE.md
@@ -112,7 +113,7 @@ pub(crate) struct ConnFailure {
 impl From<DisconnectReason> for ConnFailure {
     fn from(reason: DisconnectReason) -> Self {
         Self {
-            reason,
+            reason: Box::new(reason),
             retry_after: None,
             welcome_timeout: false,
         }

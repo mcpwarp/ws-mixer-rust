@@ -202,7 +202,7 @@ where
         }
     };
     Err(ConnFailure {
-        reason: fail(ws, conn_id, code, message).await,
+        reason: Box::new(fail(ws, conn_id, code, message).await),
         retry_after: None,
         welcome_timeout,
     })

@@ -35,7 +35,7 @@ jobs:
       - name: guard (rust-client floor not skipped)
         shell: bash
         run: |
-          floor=$(jq -r '.floors["rust-client"]' conformance/COUNTS.json)
+          floor=$(jq -er '.floors["rust-client"]' conformance/COUNTS.json)
           if grep -qF 'floor not checked for fully-skipped keys' build/conformance-fixture.stderr \
             && grep -qF '  rust-client: ' build/conformance-fixture.stderr \
             && [ "$floor" -gt 0 ]; then
@@ -76,7 +76,7 @@ jobs:
       - name: guard (go->rust floor not skipped)
         shell: bash
         run: |
-          floor=$(jq -r '.floors["go->rust"]' conformance/COUNTS.json)
+          floor=$(jq -er '.floors["go->rust"]' conformance/COUNTS.json)
           if grep -qF 'floor not checked for fully-skipped keys' build/conformance-pair.stderr \
             && grep -qF '  go->rust: ' build/conformance-pair.stderr \
             && [ "$floor" -gt 0 ]; then

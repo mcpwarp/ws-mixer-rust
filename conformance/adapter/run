@@ -10,6 +10,11 @@ set -euo pipefail
 unset CDPATH
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$dir/../.." && pwd)"
+# cargo runs from $root, so a relative CARGO_TARGET_DIR is pinned to the
+# caller's directory for both the build and the exec.
+if [[ -n "${CARGO_TARGET_DIR:-}" && "$CARGO_TARGET_DIR" != /* ]]; then
+	export CARGO_TARGET_DIR="$PWD/$CARGO_TARGET_DIR"
+fi
 bin="${CARGO_TARGET_DIR:-$root/target}/release/conformance-adapter"
 (cd "$root" && cargo build --release --locked -p ws-mixer-conformance-adapter 1>&2)
 exec "$bin"

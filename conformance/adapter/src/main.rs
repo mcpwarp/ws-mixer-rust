@@ -9,6 +9,7 @@ mod client;
 mod emit;
 mod streams;
 
+use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -22,9 +23,8 @@ use streams::{Op, Streams};
 
 pub struct Adapter {
     opts: Mutex<Options>,
-    client: Mutex<Option<Client>>,
-    /// Whether a welcomed connection is live.
-    connected: watch::Sender<bool>,
+    /// Set once by `connect`; a watch so `await_client` can wait for it.
+    client: watch::Sender<Option<Client>>,
     streams: Arc<Streams>,
 }
 
@@ -55,7 +55,12 @@ fn main() {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
         for line in std::io::stdin().lines() {
-            let Ok(line) = line else { break };
+            let line = match line {
+                Ok(l) => Ok(l),
+                // The bad line is consumed, so the next read starts clean.
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => Err(e.to_string()),
+                Err(_) => break,
+            };
             if tx.send(line).is_err() {
                 break;
             }
@@ -66,14 +71,20 @@ fn main() {
     std::process::exit(0);
 }
 
-async fn run(mut lines: mpsc::UnboundedReceiver<String>) {
+async fn run(mut lines: mpsc::UnboundedReceiver<Result<String, String>>) {
     let ad = Arc::new(Adapter {
         opts: Mutex::new(Options::default()),
-        client: Mutex::new(None),
-        connected: watch::Sender::new(false),
+        client: watch::Sender::new(None),
         streams: Streams::new(),
     });
     while let Some(line) = lines.recv().await {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                emit(json!({"event": "error", "message": format!("bad command line: {e}")}));
+                continue;
+            }
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -100,17 +111,22 @@ fn dispatch(ad: &Arc<Adapter>, cmd: Map<String, Value>) {
     let seq = cmd.get("seq").cloned().unwrap_or(Value::Null);
     let name = cmd.get("cmd").and_then(Value::as_str).unwrap_or_default();
     match name {
-        "set_options" => match lock(&ad.opts).apply(&cmd) {
-            Ok(()) => ack(&seq),
-            Err(e) => cmd_error(&seq, format!("set_options: {e}")),
-        },
+        "set_options" => {
+            // The client already took its options; changing them now would
+            // only half-apply (time_scale/floor_ms but not window etc.).
+            if ad.client.borrow().is_some() {
+                return cmd_error(&seq, "set_options: not allowed after connect");
+            }
+            match lock(&ad.opts).apply(&cmd) {
+                Ok(()) => ack(&seq),
+                Err(e) => cmd_error(&seq, format!("set_options: {e}")),
+            }
+        }
         "listen" | "open_stream" => unsupported(
             &seq,
             format!("unsupported command {name}: ws-mixer-rust is client-only"),
         ),
-        "connect" => {
-            tokio::spawn(client::connect(ad.clone(), seq, cmd));
-        }
+        "connect" => client::connect(ad, seq, &cmd),
         "write" => {
             let id = match stream_id(&cmd) {
                 Ok(id) => id,
@@ -140,8 +156,11 @@ fn dispatch(ad: &Arc<Adapter>, cmd: Map<String, Value>) {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
+            // Abort the queue here, before any later write/close_write for
+            // the id can be enqueued behind it.
+            let worker = ad.streams.abort_queue(id);
             let streams = ad.streams.clone();
-            tokio::spawn(async move { streams.reset(seq, id, code, message).await });
+            tokio::spawn(async move { streams.reset(seq, id, code, message, worker).await });
         }
         "send_app" => {
             let ad = ad.clone();
@@ -198,7 +217,7 @@ fn dispatch(ad: &Arc<Adapter>, cmd: Map<String, Value>) {
                 .to_owned();
             let ad = ad.clone();
             tokio::spawn(async move {
-                let existing = lock(&ad.client).clone();
+                let existing = ad.client.borrow().clone();
                 let client = match existing {
                     Some(c) => c,
                     None => match await_client(&ad).await {

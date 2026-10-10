@@ -8,8 +8,9 @@ reconnects on its own following the spec's backoff and drain rules.
 
 Native only (tokio). TLS via rustls with the OS trust store by default.
 
-**Status: pre-alpha.** The protocol and the reconnect loop are implemented;
-cross-SDK conformance runs and a crates.io release are still pending.
+**Status: pre-alpha.** The protocol and the reconnect loop are implemented,
+and the spec runner's client fixtures (24/24) and go->rust pair scenarios
+(10/10) pass. A crates.io release is still pending.
 Spec version: see `spec.pin`.
 
 ## Usage
@@ -81,10 +82,9 @@ make conformance-pair      # spec runner, ws-mixer-go server x this client
 The spec and the Go reference server are fetched at the tags in `spec.pin` and
 `goserver.pin` into `.spec/` and `.goserver/`.
 
-The conformance adapter (`conformance/adapter`, client role only) passes 23 of
-the 24 client fixtures and all 10 go->rust pair scenarios. The failing fixture,
-`control_flood_from_server`, needs an inbound stream-0 rate limit (WIRE.md
-§2.7) the SDK does not have yet. `conformance/COUNTS.json` holds the floors.
+The conformance adapter (`conformance/adapter`, client role only) passes all
+24 client fixtures and all 10 go->rust pair scenarios.
+`conformance/COUNTS.json` holds the floors.
 
 ## License
 

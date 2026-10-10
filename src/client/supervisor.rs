@@ -598,7 +598,7 @@ fn dial_failure(conn_id: ConnId, e: DialError) -> (DisconnectReason, Failure) {
                     welcome_timeout: f.welcome_timeout,
                 },
             };
-            (f.reason, failure)
+            (*f.reason, failure)
         }
     }
 }

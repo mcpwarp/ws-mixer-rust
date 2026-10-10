@@ -215,7 +215,7 @@ fn upgrade_failure(conn_id: ConnId, e: WsError) -> ConnFailure {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| parse_retry_after(v, SystemTime::now()));
             ConnFailure {
-                reason: r,
+                reason: Box::new(r),
                 retry_after,
                 welcome_timeout: false,
             }

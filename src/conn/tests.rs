@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role};
 
-use super::shared::WriteJob;
+use super::shared::{STREAM0_RATE, TokenBucket, WriteJob};
 use super::*;
 use crate::error::StreamError;
 use crate::event::{Event, Events};
@@ -676,11 +676,6 @@ async fn window_past_max_is_flow_control_error() {
 
 // --- writer scheduling -----------------------------------------------------------
 
-struct Noop;
-impl std::task::Wake for Noop {
-    fn wake(self: Arc<Self>) {}
-}
-
 fn decode_job(job: WriteJob) -> Frame {
     match job {
         WriteJob::Frame(b) => match frame::decode(b).unwrap() {
@@ -712,8 +707,7 @@ fn round_robin_with_control_and_pong_first() {
         conn.lock().streams.insert(id, st.clone());
         streams.push(Stream::new(st, conn.clone()));
     }
-    let waker = Arc::new(Noop).into();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(std::task::Waker::noop());
     let chunk = vec![9u8; 20_000];
     for s in &mut streams {
         for _ in 0..2 {
@@ -1026,18 +1020,61 @@ async fn pong_for_unsent_id_is_protocol_error() {
     assert!(msg.contains("pong for id 1000 was never sent"), "{msg}");
 }
 
-#[tokio::test(start_paused = true)]
-async fn control_burst_of_105_is_tolerated() {
-    let mut h = connect().await;
-    for id in 0..105 {
-        h.peer.send_json(json!({"t": "ping", "id": id})).await;
+async fn send_apps(peer: &mut Peer, range: std::ops::Range<u32>) {
+    for i in range {
+        peer.send_json(json!({"t": "app", "body": {"i": i}})).await;
     }
-    for id in 0..105 {
-        let v = h.peer.recv_raw().await;
-        assert!(
-            matches!(v, Got::Control(ref v) if v["t"] == "pong" && v["id"] == id),
-            "{v:?}"
-        );
+}
+
+async fn expect_apps(events: &mut Events, range: std::ops::Range<u32>) {
+    for i in range {
+        match events.recv().await {
+            Some(Event::App(a)) => assert_eq!(a.body["i"], i),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_zero_burst_over_100_is_enhance_your_calm() {
+    let mut h = connect().await;
+    send_apps(&mut h.peer, 0..101).await;
+    let msg = h
+        .peer
+        .expect_error(ErrorCode::ENHANCE_YOUR_CALM, 4009)
+        .await;
+    assert!(msg.contains("stream-0 message 101 "), "{msg}");
+    assert!(msg.contains("50/s (burst 100)"), "{msg}");
+    expect_apps(&mut h.events, 0..100).await;
+    let stats = h.stats.clone();
+    let (r, _) = h.finished().await;
+    assert_protocol_reason(&r, ErrorCode::ENHANCE_YOUR_CALM);
+    assert_eq!(stats.snapshot().protocol_violations, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_zero_bucket_refills_at_50_per_second() {
+    let mut h = connect().await;
+    send_apps(&mut h.peer, 0..100).await;
+    expect_apps(&mut h.events, 0..100).await;
+    assert!(!h.conn.is_terminal());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    send_apps(&mut h.peer, 100..151).await;
+    let msg = h
+        .peer
+        .expect_error(ErrorCode::ENHANCE_YOUR_CALM, 4009)
+        .await;
+    assert!(msg.contains("stream-0 message 151 "), "{msg}");
+    expect_apps(&mut h.events, 100..150).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn steady_40_per_second_is_never_limited() {
+    let mut h = connect().await;
+    for i in 0..1200 {
+        send_apps(&mut h.peer, i..i + 1).await;
+        expect_apps(&mut h.events, i..i + 1).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     h.peer.sync().await;
     h.peer.expect_quiet().await;
@@ -1073,11 +1110,10 @@ async fn event_backlog_overflow_is_enhance_your_calm() {
     let mut cfg = config();
     cfg.max_streams = 4; // limit max(128, 4 + 64) = 128
     let mut h = connect_with(cfg, welcome(262_144)).await;
-    for i in 0..128 {
-        h.peer
-            .send_json(json!({"t": "app", "body": {"i": i}}))
-            .await;
-    }
+    // Spread over 1s to stay inside the stream-0 rate limit.
+    send_apps(&mut h.peer, 0..64).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    send_apps(&mut h.peer, 64..128).await;
     h.peer.sync().await;
     h.peer.expect_quiet().await;
     // Delivering one frees one slot.
@@ -1284,7 +1320,7 @@ async fn handshake_failure(reply: Got) -> (DisconnectReason, Peer, Arc<Counters>
     .err()
     .unwrap();
     assert!(!r.welcome_timeout);
-    let r = r.reason;
+    let r = *r.reason;
     assert_eq!(r.phase, Phase::Handshake);
     (r, peer, stats)
 }
@@ -1752,6 +1788,8 @@ async fn pong_jumps_queued_data_on_the_wire() {
 async fn pong_queue_overflow_is_enhance_your_calm() {
     let mut h = connect().await;
     let (_writer, _) = stall_writer(&mut h, 262_144).await;
+    // The stream-0 rate limit would trip first.
+    h.conn.handle().shared.lock().stream0 = TokenBucket::new(2000.0, STREAM0_RATE);
     for id in 0..=1000 {
         h.peer.send_json(json!({"t": "ping", "id": id})).await;
     }

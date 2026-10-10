@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
-use ws_mixer::{Client, DisconnectReason, Event, Events, ReconnectPolicy};
+use ws_mixer::{Client, ClientState, DisconnectReason, Event, Events, ReconnectPolicy};
 
-use crate::emit::{ack, cmd_error, emit};
+use crate::emit::{ack, cmd_error, emit, with_seq};
+use crate::streams::Streams;
 use crate::{Adapter, lock};
 
 /// `set_options` values the client uses. `ping_interval_ms`/`ping_timeout_ms`
@@ -100,13 +101,9 @@ fn reconnect_policy(v: Option<&Value>) -> Result<ReconnectPolicy, String> {
     Ok(p)
 }
 
-pub async fn connect(ad: Arc<Adapter>, seq: Value, cmd: Map<String, Value>) {
-    if lock(&ad.client).is_some() {
-        return cmd_error(
-            &seq,
-            "connect: already connected (one connection per process)",
-        );
-    }
+/// Builds and starts the client on the stdin loop (`ClientBuilder::connect`
+/// does not wait), so every later command already sees it.
+pub fn connect(ad: &Arc<Adapter>, seq: Value, cmd: &Map<String, Value>) {
     let Some(url) = cmd.get("url").and_then(Value::as_str) else {
         return cmd_error(&seq, "connect: url is required");
     };
@@ -128,15 +125,33 @@ pub async fn connect(ad: Arc<Adapter>, seq: Value, cmd: Map<String, Value>) {
             b = b.allow_subfloor_timing();
         }
     }
-    let (client, events) = match b.connect() {
-        Ok(c) => c,
-        Err(e) => return cmd_error(&seq, format!("connect: {e}")),
-    };
-    *lock(&ad.client) = Some(client);
-    event_loop(ad, seq, events).await;
+    // Check and assign under the watch's lock: only one connect can win.
+    let mut started = Err("already connected (one connection per process)".to_owned());
+    ad.client.send_if_modified(|slot| {
+        if slot.is_some() {
+            return false;
+        }
+        match b.connect() {
+            Ok((client, events)) => {
+                *slot = Some(client);
+                started = Ok(events);
+                true
+            }
+            Err(e) => {
+                started = Err(e.to_string());
+                false
+            }
+        }
+    });
+    match started {
+        Ok(events) => {
+            tokio::spawn(event_loop(seq, events, ad.streams.clone()));
+        }
+        Err(e) => cmd_error(&seq, format!("connect: {e}")),
+    }
 }
 
-async fn event_loop(ad: Arc<Adapter>, seq: Value, mut events: Events) {
+async fn event_loop(seq: Value, mut events: Events, streams: Arc<Streams>) {
     let mut acked = false;
     while let Some(event) = events.recv().await {
         match event {
@@ -148,13 +163,13 @@ async fn event_loop(ad: Arc<Adapter>, seq: Value, mut events: Events) {
                 } else {
                     acked = true;
                     ack(&seq);
-                    emit(
-                        json!({"event": "connected", "seq": seq, "session": c.session, "welcome": c.welcome}),
-                    );
+                    emit(with_seq(
+                        json!({"event": "connected", "session": c.session, "welcome": c.welcome}),
+                        &seq,
+                    ));
                 }
-                ad.connected.send_replace(true);
             }
-            Event::Stream(s) => ad.streams.open(s),
+            Event::Stream(s) => streams.open(s),
             Event::App(m) => emit(json!({"event": "app", "body": m.body})),
             Event::Drain(d) => {
                 let mut e = json!({
@@ -171,8 +186,7 @@ async fn event_loop(ad: Arc<Adapter>, seq: Value, mut events: Events) {
                 emit(e);
             }
             Event::Disconnected(r) => {
-                ad.connected.send_replace(false);
-                ad.streams.conn_ended(r.conn_id);
+                streams.conn_ended(r.conn_id);
                 emit(disconnected(&r));
                 // No welcome and nothing more to come: the connect failed.
                 if !acked && r.retry_in.is_none() {
@@ -213,9 +227,21 @@ fn disconnected(r: &DisconnectReason) -> Value {
 /// Waits up to 5 s for a welcomed connection (Go adapter `awaitConn`): the
 /// runner paces on the wire and can send a command before the event loop
 /// has seen `welcome`. Returns the client if one exists by then, welcomed
-/// or not.
+/// or not. Waits on the client's own state, which stays `Connected` across
+/// a drain hand-over (the new connection can welcome before the old one
+/// reports `Disconnected`).
 pub async fn await_client(ad: &Adapter) -> Option<Client> {
-    let mut rx = ad.connected.subscribe();
-    let _ = tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|c| *c)).await;
-    lock(&ad.client).clone()
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut rx = ad.client.subscribe();
+    let client = match tokio::time::timeout_at(deadline, rx.wait_for(Option::is_some)).await {
+        Ok(Ok(c)) => c.clone()?,
+        _ => return ad.client.borrow().clone(),
+    };
+    let mut state = client.watch_state();
+    let _ = tokio::time::timeout_at(
+        deadline,
+        state.wait_for(|s| matches!(s, ClientState::Connected | ClientState::Closed)),
+    )
+    .await;
+    Some(client)
 }

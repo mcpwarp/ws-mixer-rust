@@ -27,22 +27,35 @@ pub fn emit(event: Value) {
     let _ = out.write_all(&line).and_then(|()| out.flush());
 }
 
+/// Adds `seq` to `event` unless the command had none.
+pub fn with_seq(mut event: Value, seq: &Value) -> Value {
+    if !seq.is_null() {
+        event["seq"] = seq.clone();
+    }
+    event
+}
+
 pub fn ack(seq: &Value) {
-    emit(json!({"event": "ack", "seq": seq}));
+    emit(with_seq(json!({"event": "ack"}), seq));
 }
 
 pub fn cmd_error(seq: &Value, message: impl Into<String>) {
-    emit(json!({"event": "error", "seq": seq, "message": message.into()}));
+    emit(with_seq(
+        json!({"event": "error", "message": message.into()}),
+        seq,
+    ));
 }
 
 /// The role-inapplicable shape the runner turns into a SKIP.
 pub fn unsupported(seq: &Value, message: impl Into<String>) {
-    emit(json!({
-        "event": "error",
-        "seq": seq,
-        "ok": false,
-        "unsupported": true,
-        "error": "unsupported",
-        "message": message.into(),
-    }));
+    emit(with_seq(
+        json!({
+            "event": "error",
+            "ok": false,
+            "unsupported": true,
+            "error": "unsupported",
+            "message": message.into(),
+        }),
+        seq,
+    ));
 }

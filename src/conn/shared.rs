@@ -79,6 +79,47 @@ pub(crate) struct ConnState {
     /// Round-robin order of streams with queued DATA.
     pub(crate) ready: VecDeque<u32>,
     pub(crate) in_ready: HashSet<u32>,
+    /// Inbound stream-0 message budget (WIRE.md §2.7).
+    pub(crate) stream0: TokenBucket,
+}
+
+/// Inbound stream-0 messages accepted in a burst, and refilled per second
+/// (WIRE.md §2.7; Go conn.go Stream0Burst/Stream0RateLimit).
+pub(crate) const STREAM0_BURST: f64 = 100.0;
+pub(crate) const STREAM0_RATE: f64 = 50.0;
+
+/// A token bucket on tokio's clock, so paused time drives it in tests
+/// (Go conn.go tokenBucket).
+#[derive(Debug)]
+pub(crate) struct TokenBucket {
+    tokens: f64,
+    capacity: f64,
+    rate: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    pub(crate) fn new(capacity: f64, rate: f64) -> Self {
+        Self {
+            tokens: capacity,
+            capacity,
+            rate,
+            last: Instant::now(),
+        }
+    }
+
+    /// Takes one token if one is available.
+    pub(crate) fn allow(&mut self) -> bool {
+        let now = Instant::now();
+        let refill = now.duration_since(self.last).as_secs_f64() * self.rate;
+        self.tokens = (self.tokens + refill).min(self.capacity);
+        self.last = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
 }
 
 /// The connection close the writer performs: optional `error{}`, then a
@@ -128,6 +169,7 @@ impl ConnShared {
                 control: VecDeque::new(),
                 ready: VecDeque::new(),
                 in_ready: HashSet::new(),
+                stream0: TokenBucket::new(STREAM0_BURST, STREAM0_RATE),
             }),
             writer_wake: Notify::new(),
             table_changed: Notify::new(),

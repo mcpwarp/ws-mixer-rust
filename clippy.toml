@@ -1,0 +1,2 @@
+# result_large_err fires at size >= threshold; 137 admits the 136-byte Errs we can't box: tungstenite's ErrorResponse (accept_hdr callbacks) and public wait_connected's DisconnectReason.
+large-error-threshold = 137

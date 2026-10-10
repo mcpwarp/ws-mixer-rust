@@ -13,7 +13,7 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use super::DrainSignal;
-use super::shared::{ConnShared, PanicGuard, lock};
+use super::shared::{ConnShared, PanicGuard, STREAM0_BURST, STREAM0_RATE, lock};
 use crate::control::{ControlMsg, Drain, ErrorMsg, Ping, Pong, parse_control};
 use crate::error::ErrorCode;
 use crate::event::{AppMessage, DrainNotice, Envelope, Event, EventTx};
@@ -49,6 +49,7 @@ pub(crate) async fn run<S>(
         drains,
         refused: 0,
         refused_since: None,
+        stream0_seen: 0,
     };
     loop {
         let next = tokio::select! {
@@ -107,6 +108,8 @@ struct Dispatcher {
     drains: Option<UnboundedSender<DrainSignal>>,
     refused: u32,
     refused_since: Option<Instant>,
+    /// Stream-0 messages received after `welcome`.
+    stream0_seen: u64,
 }
 
 impl Dispatcher {
@@ -410,6 +413,18 @@ impl Dispatcher {
     }
 
     fn control(&mut self, payload: &[u8]) {
+        self.stream0_seen += 1;
+        // Before parsing, like Go dispatch.go handleControlData: every
+        // stream-0 message counts, ping and pong included.
+        if !self.shared.lock().stream0.allow() {
+            return self.fail(
+                ErrorCode::ENHANCE_YOUR_CALM,
+                format!(
+                    "stream-0 message {} exceeds the rate limit of {STREAM0_RATE}/s (burst {STREAM0_BURST})",
+                    self.stream0_seen
+                ),
+            );
+        }
         let msg = match parse_control(payload, self.allow_subfloor_timing) {
             Ok(m) => m,
             Err(e) => return self.fail(e.code, e.message),

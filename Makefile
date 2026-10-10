@@ -42,6 +42,7 @@ fetch-goserver:
 adapter:
 	cargo build --release --locked -p ws-mixer-conformance-adapter
 	mkdir -p build
+	rm -f build/rust-adapter
 	cp target/release/conformance-adapter build/rust-adapter
 
 # The conformance build tag compiles in wsmixer.AllowSubfloorTiming, which the
@@ -49,6 +50,7 @@ adapter:
 .PHONY: go-adapter
 go-adapter: fetch-goserver
 	mkdir -p build
+	rm -f build/go-adapter
 	cd .goserver && go build -tags conformance -o "$(REPO)/build/go-adapter" ./cmd/conformance-adapter
 
 # .spec is its own Go module, so the runner has to be run from inside it with
