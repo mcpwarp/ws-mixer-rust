@@ -1,0 +1,13 @@
+# cargo build output.
+/target
+
+# make adapter / go-adapter output (adapter binaries, conformance runner XML
+# reports).
+/build
+
+# make fetch-spec / fetch-goserver checkouts at spec.pin / goserver.pin.
+/.spec
+/.goserver
+
+# Local MCP server config.
+/.mcp.json

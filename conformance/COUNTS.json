@@ -1,0 +1,7 @@
+{
+  "comment": "Checked-in floor on passing (SDK, fixture-or-scenario) cells for this repo's conformance jobs. rust-client is the fixture-mode column for this SDK's adapter (client role only; rust-server is all SKIP and never floor-checked, so it is omitted). go->rust is the pair matrix with ws-mixer-go (at goserver.pin, built with -tags conformance) as server and this SDK as client. The ws-mixer-spec runner at spec.pin v0.4.1 enforces a key only when the run produced rows for it and --fixture is left at \"*\". Each floor is the count actually observed passing; raise it as rows land and never lower it. Target at spec v0.4.1: rust-client 24, go->rust 10. rust-client is 23 because control_flood_from_server fails: the SDK has no inbound stream-0 rate limit (WIRE.md §2.7) yet.",
+  "floors": {
+    "rust-client": 23,
+    "go->rust": 10
+  }
+}

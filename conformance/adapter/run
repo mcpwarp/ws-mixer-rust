@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Uniform adapter entry point for the conformance runner's generic adapter
+# contract (ws-mixer-spec docs/CONFORMANCE.md section 6): every adapter is a
+# directory containing an executable `run`. It always runs cargo build first
+# (a no-op when the binary is fresh) so a developer can point the runner
+# straight at this directory without running a stale adapter. Build output
+# goes to stderr: anything on stdout that is not a JSON event line breaks
+# the runner.
+set -euo pipefail
+unset CDPATH
+dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$dir/../.." && pwd)"
+bin="${CARGO_TARGET_DIR:-$root/target}/release/conformance-adapter"
+(cd "$root" && cargo build --release --locked -p ws-mixer-conformance-adapter 1>&2)
+exec "$bin"
