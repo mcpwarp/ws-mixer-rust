@@ -56,6 +56,14 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
   msrv:
     runs-on: ubuntu-latest
     steps:

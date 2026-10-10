@@ -11,10 +11,11 @@ rust-version = "1.85"
 description = "Rust client SDK for the ws-mixer.v1 protocol: N byte streams multiplexed over one WebSocket"
 license = "Apache-2.0"
 repository = "https://github.com/mcpwarp/ws-mixer-rust"
+documentation = "https://docs.rs/ws-mixer"
 readme = "README.md"
 keywords = ["websocket", "multiplexing", "tunnel", "tokio", "mcp"]
-categories = ["network-programming", "asynchronous"]
-exclude = ["/.github", "/conformance", "/.spec", "/.goserver", "/build", "Makefile", "*.pin", "BRIEF.md", ".mcp.json", "/.claude"]
+categories = ["network-programming", "asynchronous", "web-programming::websocket"]
+exclude = ["/.github", "/conformance", "/.spec", "/.goserver", "/build", "Makefile", "*.pin", "BRIEF.md", ".mcp.json", "/.claude", "deny.toml", "clippy.toml"]
 
 [lib]
 name = "ws_mixer"
@@ -55,7 +56,7 @@ tracing = "0.1"
 webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "test-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "signal", "test-util"] }
 
 [package.metadata.docs.rs]
 all-features = true

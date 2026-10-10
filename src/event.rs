@@ -49,8 +49,9 @@ pub enum Event {
     Stream(Stream),
     /// The server sent an `app` message.
     App(AppMessage),
-    /// The server announced a drain. The client dials a replacement
-    /// connection in parallel; existing streams keep running.
+    /// The server announced a drain. Unless reconnect is disabled, the client
+    /// dials a replacement connection in parallel; existing streams keep
+    /// running.
     Drain(DrainNotice),
     /// A connection attempt failed or a connection ended. Emitted exactly once
     /// per attempt, with one exception: a token rejected before `welcome`
@@ -258,7 +259,7 @@ impl DisconnectReason {
 /// The channel is unbounded so that calling into the client from the event
 /// loop can never deadlock. Application events (`Stream`, `App`, `Drain`) are
 /// still bounded per connection: if the application stops consuming, the
-/// connection is failed with `ENHANCE_YOUR_CALM` once the backlog reaches
+/// connection is failed with `ENHANCE_YOUR_CALM` once the backlog exceeds
 /// `max(128, max_streams + 64)`.
 pub struct Events {
     rx: mpsc::UnboundedReceiver<Envelope>,

@@ -12,36 +12,51 @@
 //! ([`classify_close`]). Everything the application needs to react to arrives
 //! on the [`Events`] channel.
 //!
-//! **Status: pre-alpha.** The protocol and reconnect loop are implemented;
-//! cross-SDK conformance runs and a crates.io release are still pending.
+//! This crate implements the client role of spec v0.4.1 and passes the spec
+//! runner's 24 client fixtures and its 10 pair scenarios against the
+//! ws-mixer-go v0.7.0 server.
 //!
 //! # Example
 //!
+//! Connect with a static token, echo every stream the server opens, log
+//! application messages, and close when the client gives up:
+//!
 //! ```no_run
-//! use tokio::io::{AsyncReadExt, AsyncWriteExt};
-//! use ws_mixer::{Client, Event};
+//! use tokio::io::AsyncWriteExt;
+//! use ws_mixer::{Client, Event, SendAppError};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let (client, mut events) = Client::builder("wss://edge.example.com/v1")
+//! let (client, mut events) = Client::builder("wss://edge.example.com/v1/tunnel")
 //!     .token("secret-token")
 //!     .connect()?;
 //!
 //! while let Some(event) = events.recv().await {
 //!     match event {
-//!         Event::Connected(c) => println!("connected, session {}", c.session),
-//!         Event::Stream(mut stream) => {
+//!         Event::Connected(c) => {
+//!             println!("conn {} up, session {}, reconnect {}", c.conn_id, c.session, c.reconnect);
+//!             // Nothing is replayed after a reconnect: re-announce state here.
+//!             match client.send_app(serde_json::json!({ "op": "ready" })).await {
+//!                 Ok(()) | Err(SendAppError::NotConnected) => {}
+//!                 Err(e) => return Err(e.into()),
+//!             }
+//!         }
+//!         Event::Stream(stream) => {
+//!             // Serve each stream on its own task; never block the event loop.
 //!             tokio::spawn(async move {
-//!                 let mut request = Vec::new();
-//!                 stream.read_to_end(&mut request).await?;
-//!                 stream.write_all(b"response").await?;
-//!                 stream.close_write().await
+//!                 let (mut rx, mut tx) = stream.into_split();
+//!                 tokio::io::copy(&mut rx, &mut tx).await?; // until the peer's CLOSE
+//!                 tx.shutdown().await // our CLOSE
 //!             });
 //!         }
-//!         Event::Disconnected(reason) if reason.fatal => {
-//!             eprintln!("giving up: {reason}");
-//!             break;
+//!         Event::App(msg) => println!("app on conn {}: {:?}", msg.conn_id, msg.body),
+//!         Event::Drain(d) => println!("conn {} draining: {}", d.conn_id, d.reason),
+//!         Event::Disconnected(r) => {
+//!             println!("conn {:?} ended ({} phase): {r}", r.conn_id, r.phase);
+//!             if r.fatal {
+//!                 break;
+//!             }
 //!         }
-//!         _ => {}
+//!         _ => {} // `Event` is non-exhaustive
 //!     }
 //! }
 //! client.close().await;
@@ -49,30 +64,90 @@
 //! # }
 //! ```
 //!
-//! # Cargo features
+//! The crate's `examples/` directory has a runnable version of this
+//! (`echo_server_client`) and a [`TokenProvider`] example with a state
+//! printer driven by [`Client::watch_state`] (`token_provider`).
 //!
-//! - `rustls-platform-verifier` (default): verify server certificates against
-//!   the operating system's trust store.
-//! - `rustls-webpki-roots`: enable `TlsConfig::WebpkiRoots`, the bundled
-//!   Mozilla root set.
-//! - `native-tls`: enable `TlsConfig::NativeTls`. On its own
-//!   (`default-features = false`) it is the only TLS stack and rustls is not
-//!   compiled at all; next to the rustls features, rustls stays the default
-//!   and `NativeTls` is opt-in via [`ClientBuilder::tls`].
-//! - `ring` (default): use rustls' ring crypto provider.
-//! - `aws-lc-rs`: use rustls' aws-lc-rs crypto provider. Takes precedence
-//!   over `ring` when both are enabled; to drop ring entirely, set
-//!   `default-features = false` and re-enable the TLS features you need.
-//! - `test-util`: constructors for every event payload (`new_for_test()`
-//!   plus `with_*` setters) and `Stream::new_in_memory` with its peer types
-//!   in `ws_mixer::test_util`, for testing code that consumes this crate
-//!   without a server.
+//! # Lifecycle rules
 //!
-//! A TLS stack is required even for `ws://`-only use: the rustls features
-//! need `ring` or `aws-lc-rs`, otherwise enable `native-tls`. Builds without
-//! either fail with a `compile_error!`.
+//! - **[`Events`] is the lifeline.** Keep receiving from it for as long as
+//!   the client should live. Dropping it closes the client gracefully, even
+//!   while [`Client`] handles exist; dropping only the `Client` handles does
+//!   not. Application events are bounded per connection: a connection whose
+//!   backlog of unreceived `Stream`/`App`/`Drain` events exceeds
+//!   `max(128, max_streams + 64)` is failed with `ENHANCE_YOUR_CALM`.
+//! - **One [`Event::Disconnected`] per connection attempt.** Every attempt
+//!   that fails or ends reports exactly once. The exceptions: a token rejected
+//!   before `welcome` (HTTP 401, close 4011) that a [`Token::Provider`] gets to
+//!   refresh is retried silently and only the retry's outcome is reported, and
+//!   a dial abandoned by [`Client::close`] reports nothing. Per connection,
+//!   `Connected` comes first and `Disconnected` last, with all of its
+//!   `Stream`/`App`/`Drain` events in between.
+//! - **`fatal` is not the same as final.** [`DisconnectReason::fatal`] means
+//!   the client gave up because of an error: HTTP 403/404, close 4010
+//!   (`UNSUPPORTED`), 4011 after `welcome` or with a static token, a token
+//!   rejected again after its one refresh, a token provider returning
+//!   [`TokenError::Fatal`], reconnect disabled, or `max_attempts` reached.
+//!   A close by the application ([`Client::close`],
+//!   [`Client::close_with`]) is non-fatal but just as final.
+//!   [`ClientState::Closed`] is published when closing *begins*: no more
+//!   redials, but connections still draining after a hand-over may yet report
+//!   their `Disconnected`, even after a fatal one. [`Events::recv`] returning
+//!   `None` is the only end-of-events signal.
+//!   [`DisconnectReason::retry_in`] is set when a redial is scheduled.
+//! - **Drain hand-over overlaps connections.** On [`Event::Drain`] the
+//!   client dials a replacement (unless reconnect is disabled) while the old
+//!   connection keeps serving its streams. The replacement's `Connected` may arrive *before* the old
+//!   connection's `Disconnected`, so key any per-connection state on
+//!   [`ConnId`] ([`Connected::conn_id`], [`Stream::conn_id`],
+//!   [`DisconnectReason::conn_id`]), never on "the current connection".
+//! - **`send_app` never queues.** [`Client::send_app`] writes to the live
+//!   welcomed connection or fails with [`SendAppError::NotConnected`]; nothing
+//!   is buffered across a reconnect. During a drain it uses the old
+//!   connection until the replacement is welcomed. State the server needs on
+//!   every connection belongs in `hello.meta`
+//!   ([`ClientBuilder::hello_meta`], [`Client::set_hello_meta`]) or in a
+//!   message sent on `Connected`.
+//! - **Streams belong to one connection.** Read each [`Stream`]
+//!   continuously (unread data holds back the peer's credit). When its
+//!   connection dies, reads and writes fail with
+//!   [`StreamError::ConnectionLost`] (`ConnectionAborted`), never a clean
+//!   EOF; streams are not migrated to the next connection. Dropping a stream
+//!   that is not fully closed sends `RESET(CANCEL)`: half-close with
+//!   [`Stream::close_write`] / `shutdown()` and read to EOF to finish cleanly,
+//!   or decline it up front with [`Stream::refuse`].
 //!
-//! [ws-mixer.v1]: https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/WIRE.md
+//! # TLS and Cargo features
+//!
+//! | Feature | Default | Effect |
+//! |---|---|---|
+//! | `rustls-platform-verifier` | yes | rustls verifying against the OS trust store (`TlsConfig::PlatformVerifier`) |
+//! | `ring` | yes | rustls crypto provider: ring |
+//! | `rustls-webpki-roots` | | rustls with the bundled Mozilla roots (`TlsConfig::WebpkiRoots`) |
+//! | `aws-lc-rs` | | rustls crypto provider: aws-lc-rs; wins over `ring` when both are on |
+//! | `native-tls` | | the platform TLS library (`TlsConfig::NativeTls`) |
+//! | `test-util` | | `new_for_test()` constructors for every event payload and an in-memory `Stream` (`ws_mixer::test_util`) |
+//! | `conformance` | | test-only knobs for the spec conformance adapter; not for applications |
+//!
+//! The default for `wss://` is the platform verifier, else webpki roots, else
+//! native-tls; [`ClientBuilder::tls`] picks another, including
+//! `TlsConfig::Custom` for a caller-built `rustls::ClientConfig`.
+//!
+//! The SDK builds every rustls configuration with an explicit crypto
+//! provider and never installs or reads rustls' process-wide default
+//! provider, so it cannot panic when ring and aws-lc-rs both end up in one
+//! dependency graph (common in Tauri apps). To drop ring entirely, use
+//! `default-features = false` with `aws-lc-rs` and the rustls features you
+//! need. A TLS stack is required even for `ws://`-only use: the rustls
+//! features need `ring` or `aws-lc-rs`, otherwise enable `native-tls`. Builds
+//! without either fail with a `compile_error!`.
+//!
+//! # Runtime and MSRV
+//!
+//! tokio only; [`ClientBuilder::connect`] must be called inside a tokio
+//! runtime. The minimum supported Rust version is 1.85 (edition 2024).
+//!
+//! [ws-mixer.v1]: https://github.com/mcpwarp/ws-mixer-spec/blob/v0.4.1/docs/WIRE.md
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

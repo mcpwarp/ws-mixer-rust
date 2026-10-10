@@ -1,0 +1,46 @@
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+# Run with `cargo deny check`.
+
+[graph]
+# Check every TLS stack and crypto provider a consumer can select.
+all-features = true
+
+[advisories]
+# Unmaintained crates and yanked versions fail the check too.
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licenses only, all compatible with this crate's Apache-2.0.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "ISC",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    # webpki-root-certs: the Mozilla root store data.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+# The conformance adapter is `publish = false`.
+ignore = true
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+allow-wildcard-paths = true
+skip = [
+    # ring 0.17 pins the older majors; everything else is on the newer ones.
+    { crate = "getrandom:<0.3", reason = "ring 0.17 depends on getrandom 0.2" },
+    { crate = "windows-sys:<0.53", reason = "ring 0.17 depends on windows-sys 0.52" },
+    # The ecosystem is mid-move to syn 3 (serde, thiserror, tokio-macros);
+    # tracing, jni and openssl proc macros are still on syn 2.
+    { crate = "syn:<3", reason = "syn 2 to 3 transition" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
