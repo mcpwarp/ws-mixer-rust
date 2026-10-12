@@ -380,6 +380,7 @@ impl PeerHandle {
         }
         s.phase = StreamPhase::Closed;
         s.reset = Some((code, message.to_owned()));
+        s.reset_by_peer = true;
         s.inbuf.clear();
         s.out.clear();
         s.wake_all();
@@ -528,6 +529,34 @@ mod tests {
         drop(peer);
         let e = reader.await.unwrap().unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::ConnectionAborted);
+    }
+
+    #[tokio::test]
+    async fn closed_reports_why() {
+        use crate::StreamCloseReason;
+
+        let (mut s, peer) = Stream::new_in_memory(1);
+        s.close_write().await.unwrap();
+        peer.close();
+        assert!(matches!(s.closed().await, StreamCloseReason::Finished));
+
+        let (s, peer) = Stream::new_in_memory(3);
+        peer.reset(ErrorCode::CANCEL, "gone");
+        assert!(matches!(
+            s.closed().await,
+            StreamCloseReason::Reset {
+                code: ErrorCode::CANCEL,
+                by_peer: true,
+                ..
+            }
+        ));
+
+        let (s, peer) = Stream::new_in_memory(5);
+        drop(peer);
+        assert!(matches!(
+            s.closed().await,
+            StreamCloseReason::ConnectionLost(_)
+        ));
     }
 
     #[tokio::test]

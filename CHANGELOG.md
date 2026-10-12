@@ -34,6 +34,8 @@ First release, planned as 0.1.0. Implements the client role of ws-mixer spec v0.
 - `Stream`: server-opened streams as tokio `AsyncRead + AsyncWrite` with per-stream flow control,
   half-close (`close_write`), `reset`, `refuse`, `into_split`, and `RESET(CANCEL)` on drop.
   Errors carry a downcastable `StreamError`; a dead connection is never reported as EOF.
+- `Stream::closed` / `poll_closed` (also on both split halves): resolves when a stream ends, with a
+  `StreamCloseReason` (`Finished`, `Reset { code, message, by_peer }` or `ConnectionLost`).
 - `Client::send_app`, `close` (graceful drain then 1000), `close_with` (`APPLICATION_CLOSE`/4014),
   `drain`, `set_hello_meta`, `state`/`watch_state`, `wait_connected` (resolves with the live or next
   `welcome`, or the reason the client gave up) and cumulative `stats`.

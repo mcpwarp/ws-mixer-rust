@@ -213,11 +213,12 @@ impl ConnShared {
     ) {
         {
             let mut s = lock(&st.state);
-            if s.phase == StreamPhase::Closed {
+            if s.phase == StreamPhase::Closed || s.conn_lost.is_some() {
                 return;
             }
             s.phase = StreamPhase::Closed;
             s.reset = Some((code, message.to_owned()));
+            s.reset_by_peer = false;
             s.inbuf.clear();
             s.out.clear();
             s.wake_all();

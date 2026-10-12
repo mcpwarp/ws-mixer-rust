@@ -21,6 +21,27 @@ use crate::frame::{self, DATA_CHUNK};
 /// A stream id. Server-opened streams have odd ids; `0` is the control channel.
 pub type StreamId = u32;
 
+/// Why a stream ended. Returned by [`Stream::closed`].
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub enum StreamCloseReason {
+    /// Both directions closed cleanly (`CLOSE` in each direction).
+    Finished,
+    /// Reset by either side.
+    Reset {
+        /// The `RESET` code.
+        code: ErrorCode,
+        /// The `RESET` message (decoded lossily if not UTF-8).
+        message: String,
+        /// True when the `RESET` came from the server, false when this side
+        /// sent it ([`Stream::reset`], [`Stream::refuse`], a drop, or a
+        /// stream-level protocol error the SDK answered).
+        by_peer: bool,
+    },
+    /// The connection carrying the stream ended while it was live.
+    ConnectionLost(Arc<DisconnectReason>),
+}
+
 /// DATA chunks a stream may queue ahead of the writer (Go streamOutQueueCap):
 /// small, so writes block and round-robin rotates per 16 KiB chunk.
 const OUT_QUEUE_CAP: usize = 2;
@@ -51,11 +72,15 @@ pub(crate) struct StreamState {
     pub(crate) local_closed: bool,
     /// Set by a RESET in either direction.
     pub(crate) reset: Option<(ErrorCode, String)>,
+    /// Whether `reset` came from the peer's RESET frame.
+    pub(crate) reset_by_peer: bool,
     /// Set when the connection ended while the stream was live.
     pub(crate) conn_lost: Option<Arc<DisconnectReason>>,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
     flush_waker: Option<Waker>,
+    /// Every task waiting in [`Stream::poll_closed`], until a terminal state.
+    closed_wakers: Vec<Waker>,
 }
 
 impl StreamState {
@@ -77,6 +102,8 @@ impl StreamState {
         }
     }
 
+    /// Wakes every waiter. Runs on every transition to a terminal state
+    /// (and on the half-close that precedes one).
     pub(crate) fn wake_all(&mut self) {
         self.wake_read();
         if let Some(w) = self.write_waker.take() {
@@ -85,6 +112,29 @@ impl StreamState {
         if let Some(w) = self.flush_waker.take() {
             w.wake();
         }
+        self.wake_closed();
+    }
+
+    fn wake_closed(&mut self) {
+        for w in self.closed_wakers.drain(..) {
+            w.wake();
+        }
+    }
+
+    /// Why the stream ended, or `None` while it is live. A reset wins over
+    /// a lost connection, and both over a clean close.
+    fn close_reason(&self) -> Option<StreamCloseReason> {
+        if let Some((code, message)) = &self.reset {
+            return Some(StreamCloseReason::Reset {
+                code: *code,
+                message: message.clone(),
+                by_peer: self.reset_by_peer,
+            });
+        }
+        if let Some(r) = &self.conn_lost {
+            return Some(StreamCloseReason::ConnectionLost(r.clone()));
+        }
+        (self.phase == StreamPhase::Closed).then_some(StreamCloseReason::Finished)
     }
 
     fn error(&self) -> Option<io::Error> {
@@ -124,10 +174,12 @@ impl StreamShared {
                 remote_closed: false,
                 local_closed: false,
                 reset: None,
+                reset_by_peer: false,
                 conn_lost: None,
                 read_waker: None,
                 write_waker: None,
                 flush_waker: None,
+                closed_wakers: Vec::new(),
             }),
         }
     }
@@ -146,6 +198,17 @@ impl Handle {
         let mut cs = self.conn.lock();
         self.conn
             .reset_stream_locked(&mut cs, &self.stream, code, message);
+    }
+
+    fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<StreamCloseReason> {
+        let mut s = lock(&self.stream.state);
+        if let Some(r) = s.close_reason() {
+            return Poll::Ready(r);
+        }
+        if !s.closed_wakers.iter().any(|w| w.will_wake(cx.waker())) {
+            s.closed_wakers.push(cx.waker().clone());
+        }
+        Poll::Pending
     }
 
     /// Whether consumed data has reached the WINDOW threshold: half our
@@ -380,7 +443,7 @@ impl Stream {
 
     /// Resets the stream with `code`, discarding buffered data in both
     /// directions. Never blocks; wakes pending readers and writers. A no-op if
-    /// the stream is already closed or reset.
+    /// the stream is already closed, reset, or its connection was lost.
     pub fn reset(&self, code: ErrorCode, message: &str) {
         self.h.reset(code, message);
     }
@@ -392,6 +455,39 @@ impl Stream {
             ErrorCode::REFUSED_STREAM,
             "stream refused by the application",
         );
+    }
+
+    /// Polls for the end of the stream: `Ready` once both directions have
+    /// closed, the stream was reset, or its connection was lost; `Pending`
+    /// with the waker registered otherwise. Never consumes buffered data.
+    pub fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<StreamCloseReason> {
+        self.h.poll_closed(cx)
+    }
+
+    /// Resolves once the stream has ended, with the reason (see
+    /// [`poll_closed`](Self::poll_closed)). Cancel-safe, and may be awaited
+    /// again: once terminal it resolves at once with the same reason.
+    ///
+    /// Data still buffered for reading stays readable after it resolves.
+    /// Each distinct waker that polls it is kept until the stream ends, so
+    /// wait from one task rather than polling a fresh future from many.
+    ///
+    /// ```no_run
+    /// use ws_mixer::{Stream, StreamCloseReason};
+    ///
+    /// # async fn watch(stream: &Stream) {
+    /// match stream.closed().await {
+    ///     StreamCloseReason::Finished => println!("stream {} done", stream.id()),
+    ///     StreamCloseReason::Reset { code, by_peer, .. } => {
+    ///         println!("stream {} reset with {code} (by peer: {by_peer})", stream.id());
+    ///     }
+    ///     StreamCloseReason::ConnectionLost(r) => println!("connection lost: {r}"),
+    ///     _ => {} // `StreamCloseReason` is non-exhaustive
+    /// }
+    /// # }
+    /// ```
+    pub fn closed(&self) -> impl Future<Output = StreamCloseReason> + Send + '_ {
+        std::future::poll_fn(|cx| self.h.poll_closed(cx))
     }
 
     /// Splits the stream into independently owned read and write halves.
@@ -450,6 +546,16 @@ impl StreamReadHalf {
     pub fn id(&self) -> StreamId {
         self.h.stream.id
     }
+
+    /// See [`Stream::poll_closed`].
+    pub fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<StreamCloseReason> {
+        self.h.poll_closed(cx)
+    }
+
+    /// See [`Stream::closed`].
+    pub fn closed(&self) -> impl Future<Output = StreamCloseReason> + Send + '_ {
+        std::future::poll_fn(|cx| self.h.poll_closed(cx))
+    }
 }
 
 impl fmt::Debug for StreamReadHalf {
@@ -479,6 +585,16 @@ impl StreamWriteHalf {
     /// The stream id.
     pub fn id(&self) -> StreamId {
         self.h.stream.id
+    }
+
+    /// See [`Stream::poll_closed`].
+    pub fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<StreamCloseReason> {
+        self.h.poll_closed(cx)
+    }
+
+    /// See [`Stream::closed`].
+    pub fn closed(&self) -> impl Future<Output = StreamCloseReason> + Send + '_ {
+        std::future::poll_fn(|cx| self.h.poll_closed(cx))
     }
 }
 

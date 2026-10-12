@@ -243,6 +243,7 @@ impl Dispatcher {
                     // Never answered with a RESET (WIRE.md §2.5 note 2).
                     s.phase = StreamPhase::Closed;
                     s.reset = Some((code, message));
+                    s.reset_by_peer = true;
                     s.inbuf.clear();
                     s.out.clear();
                     s.wake_all();
@@ -299,6 +300,11 @@ impl Dispatcher {
 
     fn open(&mut self, id: u32) {
         let mut cs = self.shared.lock();
+        // The connection may have ended since `run` checked: a stream added
+        // now would never be failed.
+        if cs.terminal.is_some() {
+            return;
+        }
         if id <= cs.highest_opened {
             let h = cs.highest_opened;
             drop(cs);
@@ -526,5 +532,40 @@ impl Dispatcher {
 
     fn peer_error(&self, e: &ErrorMsg) {
         self.shared.peer_error(e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::ConnId;
+
+    /// The connection ends between `run`'s terminal check and `open`.
+    #[tokio::test]
+    async fn open_after_end_adds_no_stream() {
+        let shared = Arc::new(ConnShared::new(
+            ConnId(1),
+            "s".into(),
+            16_384,
+            16_384,
+            64,
+            Arc::new(Counters::default()),
+        ));
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut d = Dispatcher {
+            shared: shared.clone(),
+            events,
+            backlog: Arc::new(AtomicUsize::new(0)),
+            backlog_limit: 128,
+            allow_subfloor_timing: false,
+            drains: None,
+            refused: 0,
+            refused_since: None,
+            stream0_seen: 0,
+        };
+        shared.abandon();
+        d.open(1);
+        assert!(shared.lock().streams.is_empty());
+        assert!(rx.try_recv().is_err(), "no Event::Stream");
     }
 }

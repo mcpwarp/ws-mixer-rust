@@ -8,14 +8,14 @@ use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use ws_mixer::{ConnId, ErrorCode, Stream, StreamError, StreamId};
+use ws_mixer::{ConnId, ErrorCode, Stream, StreamCloseReason, StreamError, StreamId};
 
 use crate::emit::{ack, cmd_error, emit, t_ms};
 use crate::lock;
@@ -26,8 +26,6 @@ const QUEUE_CAP: usize = 64;
 /// its `Event::Stream`: the runner paces on the wire, so a `write` can
 /// arrive before the event loop has registered the stream.
 const STREAM_WAIT: Duration = Duration::from_secs(5);
-/// Poll period for a RESET that arrives after read EOF (see `watch_late_reset`).
-const LATE_RESET_POLL: Duration = Duration::from_millis(10);
 /// How long `reset` waits for the aborted queue's worker before acking, so
 /// the write the RESET unblocked reports its error first (as Go does).
 const RESET_DRAIN: Duration = Duration::from_secs(1);
@@ -230,19 +228,15 @@ impl Streams {
     /// After read EOF the SDK can still reset the stream: the peer's RESET,
     /// or one the SDK sends itself (DATA after CLOSE -> STREAM_CLOSED). A
     /// read past EOF returns `Ok(0)` immediately rather than waiting for
-    /// that, so poll with a no-op waker until the reset shows up or the
-    /// stream is retired (both halves closed, or its connection ended).
+    /// that, so wait for the stream to end instead. Only a reset is reported
+    /// here: a clean finish is reported by the worker's close_write, and a
+    /// lost connection by `disconnected`.
     async fn watch_late_reset(&self, cell: &Arc<Cell>) {
-        let mut byte = [0u8; 1];
-        while self.is_live(cell) {
-            match cell.poll_read(&mut Context::from_waker(Waker::noop()), &mut byte) {
-                Poll::Ready(Err(e)) => {
-                    self.report_reset(cell, &e);
-                    return;
-                }
-                Poll::Ready(Ok(_)) | Poll::Pending => {}
+        let reason = poll_fn(|cx| lock(&cell.stream).poll_closed(cx)).await;
+        if let StreamCloseReason::Reset { code, message, .. } = reason {
+            if self.is_live(cell) {
+                self.report_reset(cell, &StreamError::Reset { code, message }.into());
             }
-            tokio::time::sleep(LATE_RESET_POLL).await;
         }
     }
 

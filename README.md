@@ -135,7 +135,8 @@ The crate docs spell these out; in short:
 - **Streams belong to one connection.** Read them continuously. A dead connection fails reads and
   writes with `ConnectionAborted`, never a clean EOF. Dropping a stream that is not fully closed
   sends `RESET(CANCEL)`; finish with `close_write()`/`shutdown()` plus reading to EOF, or decline
-  with `refuse()`.
+  with `refuse()`. `closed().await` resolves when the stream ends, with a `StreamCloseReason`
+  (finished, reset by either side, or connection lost).
 
 ## Development
 

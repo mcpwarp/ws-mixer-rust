@@ -22,7 +22,7 @@ use super::*;
 use crate::error::StreamError;
 use crate::event::{Event, Events};
 use crate::frame::{Decoded, Frame};
-use crate::stream::{Stream, StreamShared};
+use crate::stream::{Stream, StreamCloseReason, StreamShared};
 
 const HOUR: u64 = 3_600_000;
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -1891,6 +1891,250 @@ async fn split_halves_work_concurrently() {
     // Both halves dropped after a full close: no RESET.
     h.peer.sync().await;
     h.peer.expect_quiet().await;
+}
+
+// --- closed() -----------------------------------------------------------------------
+
+async fn closed(s: &Stream) -> StreamCloseReason {
+    tokio::time::timeout(TIMEOUT, s.closed()).await.unwrap()
+}
+
+/// `closed()` is still pending: cancelling it leaves the stream untouched.
+async fn assert_open(s: &Stream) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), s.closed())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn closed_after_clean_close_in_both_orders() {
+    let mut h = connect().await;
+    // Peer first: our close_write is the terminal transition.
+    let mut a = h.open(1).await;
+    h.peer.close(1).await;
+    assert_eq!(read_to_end(&mut a).await.unwrap(), b"");
+    assert_open(&a).await;
+    a.close_write().await.unwrap();
+    assert!(matches!(closed(&a).await, StreamCloseReason::Finished));
+
+    // Us first: the peer's CLOSE, handled by the reader, is terminal.
+    let mut b = h.open(3).await;
+    b.close_write().await.unwrap();
+    assert_open(&b).await;
+    h.peer.close(3).await;
+    assert!(matches!(closed(&b).await, StreamCloseReason::Finished));
+    assert_eq!(read_to_end(&mut b).await.unwrap(), b"");
+}
+
+#[tokio::test(start_paused = true)]
+async fn closed_after_peer_reset() {
+    let mut h = connect().await;
+    let s = h.open(1).await;
+    h.peer
+        .send(frame::encode_reset(
+            1,
+            ErrorCode(0x1000_0002),
+            "peer says no",
+        ))
+        .await;
+    match closed(&s).await {
+        StreamCloseReason::Reset {
+            code,
+            message,
+            by_peer,
+        } => {
+            assert_eq!(code, ErrorCode(0x1000_0002));
+            assert_eq!(message, "peer says no");
+            assert!(by_peer);
+        }
+        r => panic!("{r:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn closed_after_local_reset_and_refuse() {
+    let mut h = connect().await;
+    let a = h.open(1).await;
+    a.reset(ErrorCode(0x1000_0001), "app code");
+    match closed(&a).await {
+        StreamCloseReason::Reset {
+            code,
+            message,
+            by_peer,
+        } => {
+            assert_eq!(code, ErrorCode(0x1000_0001));
+            assert_eq!(message, "app code");
+            assert!(!by_peer);
+        }
+        r => panic!("{r:?}"),
+    }
+
+    // A STREAM_CLOSED reset the SDK sends for a peer violation is local too.
+    let b = h.open(3).await;
+    h.peer.close(3).await;
+    h.peer.data(3, b"after close").await;
+    assert!(matches!(
+        closed(&b).await,
+        StreamCloseReason::Reset {
+            code: ErrorCode::STREAM_CLOSED,
+            by_peer: false,
+            ..
+        }
+    ));
+
+    // `refuse` consumes the stream: observe it through a second handle on
+    // the same state, taken before it leaves the table.
+    let c = h.open(5).await;
+    let shared = h.conn.handle().shared.clone();
+    let st = shared.lock().streams.get(&5).cloned().unwrap();
+    c.refuse();
+    let observer = Stream::new(st, shared);
+    assert!(matches!(
+        closed(&observer).await,
+        StreamCloseReason::Reset {
+            code: ErrorCode::REFUSED_STREAM,
+            by_peer: false,
+            ..
+        }
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn closed_after_connection_lost() {
+    let mut h = connect().await;
+    let mut a = h.open(1).await;
+    // Half-closed(remote): read EOF already seen, still live.
+    let mut b = h.open(3).await;
+    h.peer.close(3).await;
+    assert_eq!(read_to_end(&mut b).await.unwrap(), b"");
+    // Reset before the loss: the reset wins.
+    let c = h.open(5).await;
+    h.peer.reset(5, ErrorCode::CANCEL).await;
+    h.peer.sync().await;
+    let Harness { peer, conn, .. } = h;
+    drop(peer);
+    let r = tokio::time::timeout(TIMEOUT, conn.finished())
+        .await
+        .unwrap();
+
+    let err = read_some(&mut a).await.unwrap_err();
+    let StreamError::ConnectionLost(read_reason) = stream_error(&err) else {
+        panic!("{err:?}");
+    };
+    match closed(&a).await {
+        StreamCloseReason::ConnectionLost(got) => {
+            assert!(Arc::ptr_eq(&got, read_reason));
+            assert_eq!(got.message, r.message);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        closed(&b).await,
+        StreamCloseReason::ConnectionLost(_)
+    ));
+    assert!(matches!(
+        closed(&c).await,
+        StreamCloseReason::Reset {
+            code: ErrorCode::CANCEL,
+            by_peer: true,
+            ..
+        }
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn reset_after_connection_lost_keeps_the_loss() {
+    let mut h = connect().await;
+    let mut a = h.open(1).await;
+    let Harness { peer, conn, .. } = h;
+    drop(peer);
+    tokio::time::timeout(TIMEOUT, conn.finished())
+        .await
+        .unwrap();
+    a.reset(ErrorCode(0x1000_0001), "too late");
+    assert!(matches!(
+        closed(&a).await,
+        StreamCloseReason::ConnectionLost(_)
+    ));
+    assert_lost(&read_some(&mut a).await.unwrap_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn closed_wakes_a_waiting_task_and_repeats() {
+    let mut h = connect().await;
+    let s = h.open(1).await;
+    let (r, w) = s.into_split();
+    // Several waiters, on both halves, registered before the event.
+    let on_read = tokio::spawn(async move {
+        let reason = r.closed().await;
+        (r, reason)
+    });
+    let w = Arc::new(w);
+    let w2 = w.clone();
+    let on_write = tokio::spawn(async move { w2.closed().await });
+    tokio::task::yield_now().await;
+    assert!(!on_read.is_finished() && !on_write.is_finished());
+
+    h.peer.reset(1, ErrorCode::INTERNAL_ERROR).await;
+    let (r, first) = tokio::time::timeout(TIMEOUT, on_read)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        first,
+        StreamCloseReason::Reset {
+            code: ErrorCode::INTERNAL_ERROR,
+            by_peer: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        tokio::time::timeout(TIMEOUT, on_write)
+            .await
+            .unwrap()
+            .unwrap(),
+        StreamCloseReason::Reset {
+            code: ErrorCode::INTERNAL_ERROR,
+            ..
+        }
+    ));
+    // Terminal: resolves on the first poll, with the same reason, every time.
+    for _ in 0..2 {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        match std::pin::pin!(r.closed()).poll(&mut cx) {
+            Poll::Ready(StreamCloseReason::Reset {
+                code,
+                message,
+                by_peer,
+            }) => {
+                assert_eq!(code, ErrorCode::INTERNAL_ERROR);
+                assert_eq!(message, "peer reset 1");
+                assert!(by_peer);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            std::pin::pin!(w.closed()).poll(&mut cx),
+            Poll::Ready(StreamCloseReason::Reset { .. })
+        ));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_a_stream_with_a_cancelled_closed_waiter() {
+    let mut h = connect().await;
+    let s = h.open(1).await;
+    // A waker stays registered after the future is dropped.
+    assert_open(&s).await;
+    drop(s);
+    match h.peer.frame().await {
+        Frame::Reset {
+            stream_id: 1, code, ..
+        } => assert_eq!(code, ErrorCode::CANCEL),
+        f => panic!("{f:?}"),
+    }
 }
 
 // --- dial (real sockets, real time) -------------------------------------------------

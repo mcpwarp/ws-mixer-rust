@@ -174,7 +174,7 @@ pub use event::{
 };
 pub use policy::{CloseClass, classify_close};
 pub use stats::Stats;
-pub use stream::{Stream, StreamId, StreamReadHalf, StreamWriteHalf};
+pub use stream::{Stream, StreamCloseReason, StreamId, StreamReadHalf, StreamWriteHalf};
 pub use tls::TlsConfig;
 pub use token::{BoxError, Token, TokenError, TokenProvider};
 
@@ -205,6 +205,7 @@ mod auto_traits {
         send_sync_static::<Stream>();
         send_sync_static::<StreamReadHalf>();
         send_sync_static::<StreamWriteHalf>();
+        send_sync_static::<StreamCloseReason>();
         send_sync_static::<DisconnectReason>();
         send_sync_static::<Token>();
         send_sync_static::<TokenError>();
