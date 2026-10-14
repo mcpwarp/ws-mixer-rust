@@ -219,6 +219,10 @@ async fn run_client(dir: &Path) {
     while second.is_none() || old_end.is_none() {
         match next_event(&mut events).await {
             Event::Drain(d) => assert_eq!(d.conn_id, first.conn_id),
+            Event::Redial(r) => assert_eq!(
+                (r.conn_id, r.cause),
+                (Some(first.conn_id), crate::RedialCause::Drain)
+            ),
             Event::Connected(c) => second = Some(c),
             Event::Disconnected(r) => {
                 assert_eq!(r.conn_id, Some(first.conn_id), "{r:?}");

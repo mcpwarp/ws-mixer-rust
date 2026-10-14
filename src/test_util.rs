@@ -30,7 +30,8 @@ use crate::conn::shared::{ConnShared, WriteJob, lock};
 use crate::control::{ServerInfo, Welcome};
 use crate::error::{ErrorCode, StreamError};
 use crate::event::{
-    AppMessage, ConnId, Connected, DisconnectReason, DrainNotice, DrainReason, Phase,
+    AppMessage, ConnId, Connected, DisconnectReason, DrainNotice, DrainReason, Phase, RedialCause,
+    RedialNotice,
 };
 use crate::frame::{self, Decoded, Frame};
 use crate::stats::Counters;
@@ -188,6 +189,26 @@ setters!(DisconnectReason {
     with_close_reason => close_reason: Option<String>,
     with_cause => cause: Option<Arc<dyn std::error::Error + Send + Sync>>,
     with_retry_in => retry_in: Option<Duration>,
+});
+
+#[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+impl RedialNotice {
+    /// Connection 1, attempt 1, no delay, cause [`RedialCause::Failure`].
+    pub fn new_for_test() -> Self {
+        Self {
+            conn_id: Some(ConnId(1)),
+            attempt: 1,
+            delay: Duration::ZERO,
+            cause: RedialCause::Failure,
+        }
+    }
+}
+
+setters!(RedialNotice {
+    with_conn_id => conn_id: Option<ConnId>,
+    with_attempt => attempt: u32,
+    with_delay => delay: Duration,
+    with_cause => cause: RedialCause,
 });
 
 /// What a [`Stream`] made with [`Stream::new_in_memory`] sent to its peer.

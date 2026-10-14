@@ -12,9 +12,9 @@
 //! ([`classify_close`]). Everything the application needs to react to arrives
 //! on the [`Events`] channel.
 //!
-//! This crate implements the client role of spec v0.4.1 and passes the spec
+//! This crate implements the client role of spec v0.6.1 and passes the spec
 //! runner's 24 client fixtures and its 10 pair scenarios against the
-//! ws-mixer-go v0.7.0 server.
+//! ws-mixer-go v0.8.0 server.
 //!
 //! # Example
 //!
@@ -79,8 +79,11 @@
 //! - **One [`Event::Disconnected`] per connection attempt.** Every attempt
 //!   that fails or ends reports exactly once. The exceptions: a token rejected
 //!   before `welcome` (HTTP 401, close 4011) that a [`Token::Provider`] gets to
-//!   refresh is retried silently and only the retry's outcome is reported, and
-//!   a dial abandoned by [`Client::close`] reports nothing. Per connection,
+//!   refresh is retried without a `Disconnected` (an [`Event::Redial`] still
+//!   announces it) and only the retry's outcome is reported, and
+//!   a dial abandoned by [`Client::close`], [`Client::close_with`],
+//!   [`Client::close_immediate`] or a
+//!   [`ClientBuilder::no_redial_on_drain`] veto reports nothing. Per connection,
 //!   `Connected` comes first and `Disconnected` last, with all of its
 //!   `Stream`/`App`/`Drain` events in between.
 //! - **`fatal` is not the same as final.** [`DisconnectReason::fatal`] means
@@ -89,14 +92,21 @@
 //!   rejected again after its one refresh, a token provider returning
 //!   [`TokenError::Fatal`], reconnect disabled, or `max_attempts` reached.
 //!   A close by the application ([`Client::close`],
-//!   [`Client::close_with`]) is non-fatal but just as final.
+//!   [`Client::close_with`], [`Client::close_immediate`]) is non-fatal but
+//!   just as final, and so is the end of a connection whose drain was vetoed
+//!   with [`ClientBuilder::no_redial_on_drain`].
 //!   [`ClientState::Closed`] is published when closing *begins*: no more
 //!   redials, but connections still draining after a hand-over may yet report
 //!   their `Disconnected`, even after a fatal one. [`Events::recv`] returning
 //!   `None` is the only end-of-events signal.
 //!   [`DisconnectReason::retry_in`] is set when a redial is scheduled.
+//! - **Every scheduled dial is announced.** [`Event::Redial`] reports each
+//!   dial the client schedules, with its [`RedialCause`] (a failure, a drain's
+//!   replacement, or the silent token refresh), attempt number and the delay
+//!   actually used. It follows the `Disconnected` or `Drain` it answers.
 //! - **Drain hand-over overlaps connections.** On [`Event::Drain`] the
-//!   client dials a replacement (unless reconnect is disabled) while the old
+//!   client dials a replacement (unless reconnect is disabled or the drain's
+//!   reason is vetoed with [`ClientBuilder::no_redial_on_drain`]) while the old
 //!   connection keeps serving its streams. The replacement's `Connected` may arrive *before* the old
 //!   connection's `Disconnected`, so key any per-connection state on
 //!   [`ConnId`] ([`Connected::conn_id`], [`Stream::conn_id`],
@@ -115,7 +125,9 @@
 //!   EOF; streams are not migrated to the next connection. Dropping a stream
 //!   that is not fully closed sends `RESET(CANCEL)`: half-close with
 //!   [`Stream::close_write`] / `shutdown()` and read to EOF to finish cleanly,
-//!   or decline it up front with [`Stream::refuse`].
+//!   or decline it up front with [`Stream::refuse`]. [`Stream::closed`]
+//!   resolves when the stream ends, with a [`StreamCloseReason`] (finished,
+//!   reset by either side, or connection lost).
 //!
 //! # TLS and Cargo features
 //!
@@ -147,7 +159,7 @@
 //! tokio only; [`ClientBuilder::connect`] must be called inside a tokio
 //! runtime. The minimum supported Rust version is 1.85 (edition 2024).
 //!
-//! [ws-mixer.v1]: https://github.com/mcpwarp/ws-mixer-spec/blob/v0.4.1/docs/WIRE.md
+//! [ws-mixer.v1]: https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.1/docs/WIRE.md
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -170,7 +182,8 @@ pub use client::{Client, ClientBuilder, ClientState, ReconnectPolicy};
 pub use control::{AgentInfo, ServerInfo, Welcome};
 pub use error::{BuildError, CloseError, ErrorCode, SendAppError, StreamError};
 pub use event::{
-    AppMessage, ConnId, Connected, DisconnectReason, DrainNotice, DrainReason, Event, Events, Phase,
+    AppMessage, ConnId, Connected, DisconnectReason, DrainNotice, DrainReason, Event, Events,
+    Phase, RedialCause, RedialNotice,
 };
 pub use policy::{CloseClass, classify_close};
 pub use stats::Stats;
@@ -207,6 +220,8 @@ mod auto_traits {
         send_sync_static::<StreamWriteHalf>();
         send_sync_static::<StreamCloseReason>();
         send_sync_static::<DisconnectReason>();
+        send_sync_static::<RedialNotice>();
+        send_sync_static::<RedialCause>();
         send_sync_static::<Token>();
         send_sync_static::<TokenError>();
         unpin::<Stream>();

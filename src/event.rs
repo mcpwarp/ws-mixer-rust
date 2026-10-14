@@ -38,7 +38,9 @@ impl fmt::Display for ConnId {
 ///
 /// Ordering guarantees: `Connected` for a connection arrives before any of
 /// its `Stream`, `App` or `Drain` events, and its `Disconnected` arrives after
-/// all of them.
+/// all of them. A `Redial` arrives after the `Disconnected` or `Drain` that
+/// caused it and before the `Connected` or `Disconnected` of the dial it
+/// announces.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Event {
@@ -49,18 +51,82 @@ pub enum Event {
     Stream(Stream),
     /// The server sent an `app` message.
     App(AppMessage),
-    /// The server announced a drain. Unless reconnect is disabled, the client
-    /// dials a replacement connection in parallel; existing streams keep
-    /// running.
+    /// The server announced a drain. Unless reconnect is disabled or the
+    /// reason is vetoed with
+    /// [`ClientBuilder::no_redial_on_drain`](crate::ClientBuilder::no_redial_on_drain),
+    /// the client dials a replacement connection in parallel; existing
+    /// streams keep running. After a vetoed reason the application is
+    /// expected to call [`Client::close_immediate`](crate::Client::close_immediate).
     Drain(DrainNotice),
     /// A connection attempt failed or a connection ended. Emitted exactly once
     /// per attempt, with one exception: a token rejected before `welcome`
     /// (HTTP 401 or close 4011) that the provider gets to refresh is retried
-    /// at once without an event, as in the Go and JS SDKs; only the outcome
-    /// of the retry is reported. A dial cancelled by
+    /// at once without a `Disconnected`, as in the Go and JS SDKs (only an
+    /// [`Event::Redial`] with [`RedialCause::TokenRefresh`] announces it);
+    /// only the outcome of the retry is reported. A dial cancelled by
     /// [`Client::close`](crate::Client::close) reports nothing. When `fatal`
     /// is set, no further reconnect happens.
     Disconnected(DisconnectReason),
+    /// The client scheduled its next dial: a reconnect after a failure, a
+    /// drain's replacement, or the silent token-refresh redial. Emitted after
+    /// the `Disconnected` or `Drain` event it follows (the token refresh has
+    /// none) and before that dial starts. A drain whose reason is vetoed with
+    /// [`ClientBuilder::no_redial_on_drain`](crate::ClientBuilder::no_redial_on_drain)
+    /// gets none, and neither does that connection's end: the application is
+    /// expected to call [`Client::close_immediate`](crate::Client::close_immediate).
+    Redial(RedialNotice),
+}
+
+/// Why the client scheduled a dial, in [`RedialNotice::cause`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RedialCause {
+    /// A dial failed or a connection ended; the reconnect policy picked the
+    /// delay.
+    Failure,
+    /// The server drained the connection; this dial is its replacement.
+    Drain,
+    /// A token rejected before `welcome` (HTTP 401 or close 4011) is
+    /// refreshed and redialed at once. No `Disconnected` precedes it.
+    TokenRefresh,
+}
+
+impl RedialCause {
+    /// `"failure"`, `"drain"` or `"token-refresh"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Failure => "failure",
+            Self::Drain => "drain",
+            Self::TokenRefresh => "token-refresh",
+        }
+    }
+}
+
+impl fmt::Display for RedialCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Payload of [`Event::Redial`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RedialNotice {
+    /// The connection whose failure or drain led to this dial: the failed
+    /// dial's or ended connection's id for [`RedialCause::Failure`] and
+    /// [`RedialCause::TokenRefresh`], the draining connection for
+    /// [`RedialCause::Drain`]. `None` if no connection was created.
+    pub conn_id: Option<ConnId>,
+    /// For [`RedialCause::Failure`], the consecutive reconnect count since
+    /// the last stable connection, this dial included (`1` for the first).
+    /// A drain replacement is not governed by it and reports `0`; the token
+    /// refresh, the one immediate redial, reports `1`.
+    pub attempt: u32,
+    /// The delay before the dial actually used, jitter included. Zero for an
+    /// immediate redial.
+    pub delay: Duration,
+    /// Why the dial was scheduled.
+    pub cause: RedialCause,
 }
 
 /// Payload of [`Event::Connected`].
@@ -368,6 +434,13 @@ mod tests {
             assert_eq!(DrainReason::from_wire(r.as_str()), r);
         }
         assert_eq!(DrainReason::from_wire("reboot"), DrainReason::Maintenance);
+    }
+
+    #[test]
+    fn redial_cause_names() {
+        assert_eq!(RedialCause::Failure.to_string(), "failure");
+        assert_eq!(RedialCause::Drain.to_string(), "drain");
+        assert_eq!(RedialCause::TokenRefresh.to_string(), "token-refresh");
     }
 
     #[test]

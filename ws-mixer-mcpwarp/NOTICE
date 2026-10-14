@@ -1,0 +1,9 @@
+ws-mixer-rust
+Copyright 2026 Anatoly Tarnavsky
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This crate's runtime dependencies (tokio, tokio-tungstenite, rustls, serde and
+others listed in Cargo.toml) are distributed under MIT, Apache-2.0, ISC,
+BSD-3-Clause, Unicode-3.0 or CDLA-Permissive-2.0 (the webpki-root-certs
+Mozilla root store data) terms, all compatible with Apache-2.0.

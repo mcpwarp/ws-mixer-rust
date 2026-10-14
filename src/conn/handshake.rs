@@ -4,6 +4,7 @@
 //! here is reported with phase `Handshake`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -26,11 +27,15 @@ use crate::stats::Counters;
 
 const PHASE: Phase = Phase::Handshake;
 
+/// Sets `failing` before it starts closing the socket for a handshake
+/// failure, so an abandoning caller lets that close finish instead of
+/// sending a second `error`.
 pub(crate) async fn run<S>(
     ws: &mut WebSocketStream<S>,
     cfg: &ConnConfig,
     token: String,
     conn_id: ConnId,
+    failing: &AtomicBool,
 ) -> Result<Welcome, ConnFailure>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -53,6 +58,7 @@ where
                 frame::MAX_CONTROL_PAYLOAD
             );
             // Redialing sends the same oversized hello again.
+            failing.store(true, Ordering::Release);
             let mut reason = fail(ws, conn_id, ErrorCode::INTERNAL_ERROR, msg).await;
             reason.fatal = true;
             return Err(reason.into());
@@ -201,6 +207,7 @@ where
             }
         }
     };
+    failing.store(true, Ordering::Release);
     Err(ConnFailure {
         reason: Box::new(fail(ws, conn_id, code, message).await),
         retry_after: None,

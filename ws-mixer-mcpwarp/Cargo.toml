@@ -1,0 +1,67 @@
+[package]
+name = "ws-mixer-mcpwarp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "The mcpwarp layer over ws-mixer: expose a local MCP server at a public mcpwarp URL"
+license = "Apache-2.0"
+repository = "https://github.com/mcpwarp/ws-mixer-rust"
+documentation = "https://docs.rs/ws-mixer-mcpwarp"
+readme = "README.md"
+keywords = ["mcp", "mcpwarp", "tunnel", "websocket", "tokio"]
+categories = ["network-programming", "asynchronous", "web-programming"]
+# tests/ stays out (cargo warns "ignoring test ..." for each): the fixture
+# runners read the ws-mixer-spec checkout next to the workspace, which a
+# packaged crate does not have. Unit tests and doctests ship with src/.
+include = ["/src", "/examples", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE"]
+
+[lib]
+name = "ws_mixer_mcpwarp"
+
+[features]
+default = ["target", "rustls-platform-verifier", "ring"]
+# `target` mode: forward requests to a local `http://` server with hyper.
+target = ["dep:hyper", "dep:hyper-util"]
+# TLS stacks and crypto providers, forwarded to ws-mixer's features of the
+# same name (see its docs). A build needs one: without any, ws-mixer stops
+# with a compile_error.
+rustls-platform-verifier = ["ws-mixer/rustls-platform-verifier"]
+rustls-webpki-roots = ["ws-mixer/rustls-webpki-roots"]
+native-tls = ["ws-mixer/native-tls"]
+ring = ["ws-mixer/ring"]
+aws-lc-rs = ["ws-mixer/aws-lc-rs"]
+# A fake connection layer and edge script driver for testing code that uses
+# this crate.
+test-util = ["ws-mixer/test-util"]
+
+[dependencies]
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
+serde = { version = "1", features = ["derive"] }
+# preserve_order: `register` / `unregister` must keep their key order
+# byte-exact (MCPWARP.md §2.2).
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "io-util"] }
+tower-service = "0.3"
+tracing = "0.1"
+ws-mixer = { path = "..", version = "0.2", default-features = false }
+
+[dev-dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "test-util"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tracing-subscriber = "0.3"
+ws-mixer = { path = "..", version = "0.2", default-features = false, features = ["test-util"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }

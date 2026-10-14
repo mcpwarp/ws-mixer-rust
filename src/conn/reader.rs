@@ -389,7 +389,8 @@ impl Dispatcher {
 
     /// Hands an application event to the channel, failing the connection with
     /// `ENHANCE_YOUR_CALM` when the application has fallen too far behind.
-    fn emit(&self, event: Event) {
+    /// Whether the event reached the channel.
+    fn emit(&self, event: Event) -> bool {
         let pending = self.backlog.fetch_add(1, Ordering::AcqRel);
         if pending >= self.backlog_limit {
             self.backlog.fetch_sub(1, Ordering::AcqRel);
@@ -407,7 +408,7 @@ impl Dispatcher {
                     self.backlog_limit
                 ),
             );
-            return;
+            return false;
         }
         let envelope = Envelope {
             event,
@@ -415,7 +416,9 @@ impl Dispatcher {
         };
         if self.events.send(envelope).is_err() {
             self.backlog.fetch_sub(1, Ordering::AcqRel);
+            return false;
         }
+        true
     }
 
     fn control(&mut self, payload: &[u8]) {
@@ -454,10 +457,12 @@ impl Dispatcher {
             ControlMsg::Pong(p) => self.pong(&p),
             ControlMsg::Drain(d) => self.drain(d),
             ControlMsg::Error(e) => self.peer_error(&e),
-            ControlMsg::App(a) => self.emit(Event::App(AppMessage {
-                conn_id: self.shared.conn_id,
-                body: a.body,
-            })),
+            ControlMsg::App(a) => {
+                self.emit(Event::App(AppMessage {
+                    conn_id: self.shared.conn_id,
+                    body: a.body,
+                }));
+            }
         }
     }
 
@@ -513,21 +518,29 @@ impl Dispatcher {
             );
         }
         tracing::info!(conn_id = %self.shared.conn_id, reason = %d.reason, last_stream_id = d.last_stream_id, "server drain");
-        if let Some(drains) = &self.drains {
-            let _ = drains.send(DrainSignal {
-                conn_id: self.shared.conn_id,
-                retry_after: d.retry_after_ms.map(Duration::from_millis),
-            });
-        }
-        self.emit(Event::Drain(DrainNotice {
+        let retry_after = d.retry_after_ms.map(Duration::from_millis);
+        let reason = d.drain_reason();
+        let delivered = self.emit(Event::Drain(DrainNotice {
             conn_id: self.shared.conn_id,
-            reason: d.drain_reason(),
+            reason,
             raw_reason: d.reason,
             last_stream_id: d.last_stream_id,
             deadline: d.deadline_ms.map(Duration::from_millis),
-            retry_after: d.retry_after_ms.map(Duration::from_millis),
+            retry_after,
             message: d.message,
         }));
+        // After the Drain event, so the supervisor's Event::Redial for the
+        // replacement follows it on the channel. A dropped event (backlog
+        // full: the connection is failing) gets no replacement, so no Redial
+        // answers a Drain nobody saw, but a vetoed reason still applies.
+        if let Some(drains) = &self.drains {
+            let _ = drains.send(DrainSignal {
+                conn_id: self.shared.conn_id,
+                reason,
+                retry_after,
+                delivered,
+            });
+        }
     }
 
     fn peer_error(&self, e: &ErrorMsg) {

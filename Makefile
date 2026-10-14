@@ -82,6 +82,13 @@ smoke: adapter
 	echo "$$line"; \
 	echo "$$line" | grep -q '"event":"ready"' || { echo "smoke: adapter did not print ready" >&2; exit 1; }
 
+# ws-mixer-mcpwarp's runners for spec/fixtures/mcpwarp (MCPWARP.md §10), with
+# their per-set counts and skip notes printed. The tunnel runner drives the
+# fake edge, so it needs `test-util`; without it it only prints "skipped".
+.PHONY: mcpwarp-fixtures
+mcpwarp-fixtures: fetch-spec
+	WSMIXER_SPEC_DIR="$(REPO)/.spec" cargo test -p ws-mixer-mcpwarp --features test-util --test 'fixtures_*' -- --nocapture
+
 .PHONY: fmt
 fmt:
 	cargo fmt --all

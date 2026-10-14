@@ -27,7 +27,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - run: cargo clippy --locked --all-targets --no-default-features --features ring -- -D warnings
+      # One package at a time, so no other member's features are unified in.
+      # ws-mixer-mcpwarp without defaults: no `target`, and a non-default TLS
+      # stack (without any, ws-mixer's compile_error fires).
+      - run: cargo clippy --locked -p ws-mixer --all-targets --no-default-features --features ring -- -D warnings
+      - run: cargo clippy --locked -p ws-mixer-mcpwarp --all-targets --no-default-features --features native-tls -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -36,13 +40,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: make fetch-spec
-      - run: cargo test --locked
+      # WSMIXER_SPEC_DIR points both crates' fixture tests at .spec; GitHub
+      # sets CI, so ws-mixer-mcpwarp's fail rather than skip without it.
+      - run: cargo test --locked --workspace
         env:
           WSMIXER_SPEC_DIR: ${{ github.workspace }}/.spec
       - run: cargo test --locked --workspace --all-features
         env:
           WSMIXER_SPEC_DIR: ${{ github.workspace }}/.spec
       - run: cargo test --locked -p ws-mixer --no-default-features --features ring --lib
+        env:
+          WSMIXER_SPEC_DIR: ${{ github.workspace }}/.spec
+      - run: cargo test --locked -p ws-mixer-mcpwarp --no-default-features --features native-tls
         env:
           WSMIXER_SPEC_DIR: ${{ github.workspace }}/.spec
 
@@ -52,7 +61,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --locked --no-deps --all-features
+      - run: cargo doc --locked --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 

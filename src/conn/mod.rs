@@ -1,7 +1,7 @@
 //! One WebSocket connection: dial, handshake, and the reader, writer and
 //! keepalive tasks that run it.
 //!
-//! [`Conn::dial`] (or [`Conn::establish`] on an already-upgraded socket)
+//! [`Conn::dial_via`] (or, in tests, `Conn::establish` on an already-upgraded socket)
 //! returns a [`Handshaken`] connection that has received `welcome` but whose
 //! tasks are not running yet, so the supervisor can emit `Connected` before
 //! the reader produces any `Stream`/`App`/`Drain` event. [`Handshaken::start`]
@@ -22,6 +22,7 @@ mod tests;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue};
@@ -52,6 +53,22 @@ pub(crate) const CLOSE_ECHO_WAIT: Duration = Duration::from_secs(2);
 /// How long a graceful close waits for streams to finish (WIRE.md §2.10 rule 14).
 pub(crate) const GRACEFUL_CLOSE_WAIT: Duration = Duration::from_secs(5);
 
+/// Why a dial in progress was abandoned: the `error` code and message to
+/// close with once `hello` may have gone out.
+pub(crate) type Abandon = (ErrorCode, String);
+
+/// Set to `Some` to abandon a dial; `None` while it may proceed.
+pub(crate) type AbandonRx = tokio::sync::watch::Receiver<Option<Abandon>>;
+
+/// Resolves once the dial is abandoned; never if the sender is gone first.
+pub(crate) async fn abandoned(rx: &mut AbandonRx) -> Abandon {
+    let set = rx.wait_for(Option::is_some).await.map(|v| v.clone());
+    match set {
+        Ok(v) => v.unwrap_or((ErrorCode::NO_ERROR, String::new())),
+        Err(_) => std::future::pending().await,
+    }
+}
+
 /// Everything one dial needs. Built by the supervisor from the
 /// `ClientBuilder`; the token is passed separately because it is fetched per
 /// dial.
@@ -78,7 +95,12 @@ pub(crate) struct ConnConfig {
 #[derive(Clone, Debug)]
 pub(crate) struct DrainSignal {
     pub(crate) conn_id: ConnId,
+    pub(crate) reason: crate::event::DrainReason,
     pub(crate) retry_after: Option<Duration>,
+    /// Whether the `Event::Drain` reached the application. A dropped one
+    /// (backlog full: the connection is failing) still marks a vetoed
+    /// reason, but dials no replacement.
+    pub(crate) delivered: bool,
 }
 
 impl ConnConfig {
@@ -153,23 +175,78 @@ impl Conn {
         events: EventTx,
         conn_id: ConnId,
     ) -> Result<Handshaken<dial::BoxIo>, ConnFailure> {
-        Self::dial_via(&network_upgrade(), cfg, token, events, conn_id).await
+        let (_never, abandon) = tokio::sync::watch::channel(None);
+        Self::dial_via(&network_upgrade(), cfg, token, events, conn_id, abandon).await
     }
 
-    /// [`dial`](Self::dial) over `upgrade`.
+    /// [`dial`](Self::dial) over `upgrade`, abandoned when `abandon` is set.
+    /// Before the upgrade completes that just stops the dial; after it
+    /// (`hello` may have gone out), the socket is closed with the given
+    /// `error{code, message}` and the matching close, bounded by
+    /// [`SHUTDOWN_WRITE_TIMEOUT`]. Either way the result is an error and no
+    /// `Handshaken` is returned.
     pub(crate) async fn dial_via(
         upgrade: &Upgrade,
         cfg: &ConnConfig,
         token: String,
         events: EventTx,
         conn_id: ConnId,
+        mut abandon: AbandonRx,
     ) -> Result<Handshaken<dial::BoxIo>, ConnFailure> {
+        let gone = |message: &str| -> ConnFailure {
+            base_reason(
+                Some(conn_id),
+                Phase::Handshake,
+                format!("dial abandoned: {message}"),
+            )
+            .into()
+        };
         Counters::inc(&cfg.stats.dials);
-        let ws = upgrade(cfg.clone(), token.clone(), conn_id).await?;
-        Self::establish(ws, cfg, token, events, conn_id).await
+        let mut ws = tokio::select! {
+            biased;
+            (_, message) = abandoned(&mut abandon) => return Err(gone(&message)),
+            ws = upgrade(cfg.clone(), token.clone(), conn_id) => ws?,
+        };
+        let failing = AtomicBool::new(false);
+        // Once the handshake is closing the socket for its own failure, the
+        // abandon waits: that close finishes and the dial fails anyway.
+        let abandon_unless_failing = async {
+            let a = abandoned(&mut abandon).await;
+            if failing.load(Ordering::Acquire) {
+                std::future::pending::<()>().await;
+            }
+            a
+        };
+        let step = tokio::select! {
+            biased;
+            a = abandon_unless_failing => Err(a),
+            r = handshake::run(&mut ws, cfg, token, conn_id, &failing) => Ok(r),
+        };
+        match step {
+            Ok(r) => {
+                let welcome = r?;
+                Counters::inc(&cfg.stats.connects);
+                Ok(Handshaken {
+                    ws,
+                    welcome,
+                    cfg: cfg.clone(),
+                    events,
+                    conn_id,
+                })
+            }
+            Err((code, message)) => {
+                let _ = tokio::time::timeout(
+                    SHUTDOWN_WRITE_TIMEOUT,
+                    handshake::close_with_error(&mut ws, code, &message),
+                )
+                .await;
+                Err(gone(&message))
+            }
+        }
     }
 
     /// Runs the handshake on an already-upgraded WebSocket.
+    #[cfg(test)]
     pub(crate) async fn establish<S>(
         mut ws: WebSocketStream<S>,
         cfg: &ConnConfig,
@@ -180,7 +257,8 @@ impl Conn {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let welcome = handshake::run(&mut ws, cfg, token, conn_id).await?;
+        let failing = AtomicBool::new(false);
+        let welcome = handshake::run(&mut ws, cfg, token, conn_id, &failing).await?;
         Counters::inc(&cfg.stats.connects);
         Ok(Handshaken {
             ws,

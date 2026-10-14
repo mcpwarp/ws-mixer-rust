@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use crate::conn::ConnConfig;
 use crate::control::{AgentInfo, Welcome};
 use crate::error::{BuildError, CloseError, SendAppError};
-use crate::event::{DisconnectReason, Events};
+use crate::event::{DisconnectReason, DrainReason, Events};
 use crate::stats::Stats;
 use crate::tls::TlsConfig;
 use crate::token::Token;
@@ -106,6 +106,7 @@ pub struct ClientBuilder {
     hello_timeout: Duration,
     tls: Option<TlsConfig>,
     allow_subfloor_timing: bool,
+    no_redial_on: Vec<DrainReason>,
 }
 
 impl ClientBuilder {
@@ -123,6 +124,7 @@ impl ClientBuilder {
             hello_timeout: Duration::from_secs(10),
             tls: TlsConfig::default_for_build(),
             allow_subfloor_timing: false,
+            no_redial_on: Vec::new(),
         }
     }
 
@@ -146,6 +148,21 @@ impl ClientBuilder {
     pub fn agent(mut self, sdk: &str, version: &str) -> Self {
         self.agent.sdk = sdk.to_owned();
         self.agent.sdk_version = version.to_owned();
+        self
+    }
+
+    /// Overrides `hello.agent.runtime`, by default `"rust"`. 1 to 128
+    /// characters; checked by [`connect`](Self::connect).
+    pub fn agent_runtime(mut self, runtime: impl Into<String>) -> Self {
+        self.agent.runtime = Some(runtime.into());
+        self
+    }
+
+    /// Overrides `hello.agent.os`, by default `"<os>/<arch>"` from
+    /// [`std::env::consts`], e.g. `"macos/aarch64"`. 1 to 128 characters;
+    /// checked by [`connect`](Self::connect).
+    pub fn agent_os(mut self, os: impl Into<String>) -> Self {
+        self.agent.os = Some(os.into());
         self
     }
 
@@ -196,6 +213,39 @@ impl ClientBuilder {
         self
     }
 
+    /// Does not dial a replacement for a server `drain` with this `reason`;
+    /// calling it again for the same reason has no effect. The
+    /// [`Event::Drain`](crate::Event::Drain) is still delivered, but no
+    /// [`Event::Redial`](crate::Event::Redial) follows: the drained
+    /// connection stays the live one, no later drain on it dials either, and
+    /// a replacement still pending from an earlier drain of it is abandoned.
+    /// The application is expected to close the client in response,
+    /// typically with [`Client::close_immediate`]. If the connection ends
+    /// first, unless a replacement is already live, it reports one non-fatal
+    /// `Disconnected` with no `retry_in` and the client closes (unlike
+    /// reconnect disabled, which ends fatal); nothing is redialed. The same
+    /// holds when the connection is failed with `ENHANCE_YOUR_CALM` because
+    /// the event backlog was full and the `Drain` event itself was dropped.
+    ///
+    /// Abandoning a pending replacement prevents its `hello` only while its
+    /// WebSocket upgrade has not completed; such a dial is cancelled
+    /// silently. A replacement past its upgrade when the vetoed drain is
+    /// processed is closed with `error{NO_ERROR}` and close 1000 whether or
+    /// not its `welcome` arrived, and is never reported as `Connected`; the
+    /// server will usually have seen its `hello` (an abandon landing between
+    /// the upgrade and the `hello` write closes without a `hello` first).
+    ///
+    /// For a layer that treats a drain as a take-over: mcpwarp's
+    /// `drain{reason: "replaced"}` must not lead to a `hello` on a
+    /// replacement, which a replacement dialed with zero delay could
+    /// otherwise send before the application sees the `Drain` event.
+    pub fn no_redial_on_drain(mut self, reason: DrainReason) -> Self {
+        if !self.no_redial_on.contains(&reason) {
+            self.no_redial_on.push(reason);
+        }
+        self
+    }
+
     /// Accepts `welcome` timing below the spec floors (`ping_interval < 5000`,
     /// `ping_timeout < 2 * ping_interval`). Conformance testing only.
     #[cfg(feature = "conformance")]
@@ -240,7 +290,14 @@ impl ClientBuilder {
         {
             return Err(BuildError::InvalidCapability(bad.clone()));
         }
-        for field in [&self.agent.sdk, &self.agent.sdk_version] {
+        let a = &self.agent;
+        let agent_fields = [
+            Some(&a.sdk),
+            Some(&a.sdk_version),
+            a.runtime.as_ref(),
+            a.os.as_ref(),
+        ];
+        for field in agent_fields.into_iter().flatten() {
             if !(1..=128).contains(&field.chars().count()) {
                 return Err(BuildError::InvalidAgent(field.clone()));
             }
@@ -345,6 +402,7 @@ impl ClientBuilder {
             cfg,
             token,
             policy: self.reconnect,
+            no_redial_on: self.no_redial_on,
             upgrade,
             rng,
             events: events_tx,
@@ -560,10 +618,12 @@ impl Client {
     /// Closes gracefully: sends `drain{client_requested}`, waits up to 5 s for
     /// streams to finish, then `error{NO_ERROR}` and WebSocket close 1000.
     /// Stops the reconnect loop; a dial in progress is abandoned without an
-    /// event. Each live connection reports one non-fatal `Disconnected`, then
-    /// [`Events::recv`] returns `None`.
+    /// event (one past its upgrade is closed with `error{NO_ERROR}` and 1000,
+    /// bounded by about 2 s). Each live connection reports one non-fatal
+    /// `Disconnected`, then [`Events::recv`] returns `None`.
     ///
-    /// Returns once every connection has closed. Idempotent.
+    /// Returns once every connection has closed, including such a dial.
+    /// Idempotent.
     pub async fn close(&self) {
         let _ = self.inner.commands.send(Command::Close);
         self.inner.commands.closed().await;
@@ -571,13 +631,37 @@ impl Client {
 
     /// Closes immediately as an application close: `error{APPLICATION_CLOSE,
     /// message}` and WebSocket close 4014, with the reason truncated to 123
-    /// bytes. Stops the reconnect loop; exactly one non-fatal `Disconnected`
-    /// is emitted per live connection.
+    /// bytes. Stops the reconnect loop; a dial in progress is abandoned
+    /// without an event, and one past its upgrade is closed the same way,
+    /// bounded by about 2 s. Exactly one non-fatal `Disconnected` is emitted
+    /// per live connection.
     ///
-    /// Returns once every connection has closed. A no-op (apart from waiting)
-    /// if a close is already in progress.
+    /// Returns once every connection has closed, including such a dial. A
+    /// no-op (apart from waiting) if a close is already in progress.
     pub async fn close_with(&self, message: impl Into<String>) {
         let _ = self.inner.commands.send(Command::CloseWith(message.into()));
+        self.inner.commands.closed().await;
+    }
+
+    /// Closes at once with `error{NO_ERROR, message}` and WebSocket close
+    /// 1000 (reason truncated to 123 bytes), skipping [`close`](Self::close)'s
+    /// `drain` and 5 s wait: open streams end with the connection, as after
+    /// [`close_with`](Self::close_with). For a peer whose streams are already
+    /// stale, e.g. a service taken over by another connection. Stops the
+    /// reconnect loop; a scheduled or in-progress dial is abandoned without
+    /// an event, and one past its upgrade (`welcome` received or not) is
+    /// closed the same way, bounded by about 2 s. Exactly one non-fatal
+    /// `Disconnected` is emitted per live connection.
+    ///
+    /// Returns once every connection has closed. The live connection closes
+    /// at once, but with such a dial in flight this may return up to ~2 s
+    /// later (~5 s at worst, if its `welcome` lands during the fallback). A
+    /// no-op (apart from waiting) if a close is already in progress.
+    pub async fn close_immediate(&self, message: impl Into<String>) {
+        let _ = self
+            .inner
+            .commands
+            .send(Command::CloseImmediate(message.into()));
         self.inner.commands.closed().await;
     }
 

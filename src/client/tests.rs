@@ -20,7 +20,7 @@ use super::*;
 use crate::conn::dial::BoxIo;
 use crate::conn::{ConnFailure, base_reason};
 use crate::error::ErrorCode;
-use crate::event::{ConnId, Connected, Event, Phase};
+use crate::event::{ConnId, Connected, Event, Phase, RedialCause, RedialNotice};
 use crate::frame::{self, Decoded, Frame};
 use crate::token::TokenError;
 
@@ -116,8 +116,12 @@ impl Peer {
     }
 
     async fn drain(&mut self, retry_after_ms: Option<u64>) {
+        self.drain_for("rollout", retry_after_ms).await;
+    }
+
+    async fn drain_for(&mut self, reason: &str, retry_after_ms: Option<u64>) {
         let mut d =
-            json!({"t": "drain", "reason": "rollout", "last_stream_id": 1, "deadline_ms": 30_000});
+            json!({"t": "drain", "reason": reason, "last_stream_id": 1, "deadline_ms": 30_000});
         if let Some(ms) = retry_after_ms {
             d["retry_after_ms"] = json!(ms);
         }
@@ -251,8 +255,12 @@ fn builder() -> ClientBuilder {
 }
 
 fn start(b: ClientBuilder) -> (Client, Events, Server) {
+    start_with_rng(b, 0.5)
+}
+
+fn start_with_rng(b: ClientBuilder, rng: f64) -> (Client, Events, Server) {
     let (up, server) = upgrade();
-    let (client, events) = b.connect_via(up, Box::new(|| 0.5)).unwrap();
+    let (client, events) = b.connect_via(up, Box::new(move || rng)).unwrap();
     (client, events, server)
 }
 
@@ -267,11 +275,29 @@ fn counting_provider() -> (Token, Arc<AtomicU32>) {
     (token, n)
 }
 
-async fn next(events: &mut Events) -> Event {
+/// The next event, `Redial` included.
+async fn next_any(events: &mut Events) -> Event {
     tokio::time::timeout(WAIT, events.recv())
         .await
         .expect("timed out waiting for an event")
         .expect("event channel closed")
+}
+
+/// The next event other than `Redial`; the `redial_*` tests check those.
+async fn next(events: &mut Events) -> Event {
+    loop {
+        match next_any(events).await {
+            Event::Redial(_) => {}
+            e => return e,
+        }
+    }
+}
+
+async fn redial(events: &mut Events) -> RedialNotice {
+    match next_any(events).await {
+        Event::Redial(r) => r,
+        other => panic!("expected Redial, got {other:?}"),
+    }
 }
 
 async fn connected(events: &mut Events) -> Connected {
@@ -295,11 +321,18 @@ async fn stream(events: &mut Events) -> crate::Stream {
     }
 }
 
+/// The end of events, skipping `Redial`s queued before the close.
 async fn ended(events: &mut Events) {
-    let e = tokio::time::timeout(WAIT, events.recv())
-        .await
-        .expect("timed out waiting for the end of events");
-    assert!(e.is_none(), "expected the end of events, got {e:?}");
+    loop {
+        let e = tokio::time::timeout(WAIT, events.recv())
+            .await
+            .expect("timed out waiting for the end of events");
+        match e {
+            None => return,
+            Some(Event::Redial(_)) => {}
+            Some(e) => panic!("expected the end of events, got {e:?}"),
+        }
+    }
 }
 
 // --- token refresh ---------------------------------------------------------
@@ -985,6 +1018,629 @@ async fn dropping_events_alone_closes_gracefully() {
     server.no_dial(Duration::from_secs(600)).await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn close_immediate_sends_no_error_and_1000_without_draining() {
+    let (client, mut events, mut server) = start(builder());
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p.open(1).await;
+    let mut s = stream(&mut events).await;
+    let t = Instant::now();
+    let closing = {
+        let client = client.clone();
+        tokio::spawn(async move { client.close_immediate("TAKEN_OVER: replaced").await })
+    };
+    // No drain{client_requested} first, and no wait for the open stream.
+    let e = p.control().await;
+    assert_eq!(
+        e,
+        json!({"t": "error", "code": 0, "message": "TAKEN_OVER: replaced"})
+    );
+    assert!(matches!(p.next().await, Got::Close(1000, ref r) if r == "TAKEN_OVER: replaced"));
+    assert_eq!(t.elapsed(), Duration::ZERO);
+    p.finish().await;
+    closing.await.unwrap();
+    let r = disconnected(&mut events).await;
+    assert_eq!(
+        (r.conn_id, r.ws_code, r.error_code, r.fatal),
+        (Some(ConnId(1)), Some(1000), None, false)
+    );
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        s.read(&mut buf).await.unwrap_err().kind(),
+        std::io::ErrorKind::ConnectionAborted
+    );
+    ended(&mut events).await;
+    assert_eq!(client.state(), ClientState::Closed);
+    assert_eq!(client.send_app(json!({})).await, Err(SendAppError::Closed));
+    assert!(!client.wait_connected().await.unwrap_err().fatal);
+    server.no_dial(Duration::from_secs(600)).await;
+    // Idempotent.
+    client.close_immediate("again").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_immediate_during_a_drain_abandons_the_replacement() {
+    let (client, mut events, mut server) = start(builder());
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p.open(1).await;
+    let _s = stream(&mut events).await;
+    p.drain(Some(5000)).await;
+    assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    let r = redial(&mut events).await;
+    assert_eq!((r.cause, r.delay), (RedialCause::Drain, S * 5));
+    let closing = tokio::spawn(async move { client.close_immediate("TAKEN_OVER").await });
+    assert_eq!(p.control().await["code"], 0);
+    assert!(matches!(p.next().await, Got::Close(1000, _)));
+    p.finish().await;
+    closing.await.unwrap();
+    let r = disconnected(&mut events).await;
+    assert_eq!(
+        (r.conn_id, r.ws_code, r.fatal),
+        (Some(ConnId(1)), Some(1000), false)
+    );
+    ended(&mut events).await;
+    server.no_dial(Duration::from_secs(600)).await;
+}
+
+// --- Event::Redial -------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn redial_failure_follows_disconnected_with_attempt_and_delay() {
+    let (_client, mut events, mut server) = start(builder());
+    drop(server.dial().await);
+    let r = match next_any(&mut events).await {
+        Event::Disconnected(r) => r,
+        other => panic!("expected Disconnected, got {other:?}"),
+    };
+    assert_eq!(r.retry_in, Some(S));
+    let t = Instant::now();
+    let n = redial(&mut events).await;
+    assert_eq!(
+        n,
+        RedialNotice {
+            conn_id: Some(ConnId(1)),
+            attempt: 1,
+            delay: S,
+            cause: RedialCause::Failure,
+        }
+    );
+    let d = server.dial().await;
+    assert_eq!(d.at - t, S, "the delay reported is the one used");
+
+    // A connection that ends after welcome: attempt 2, 0.5 * 4 s.
+    let mut p = d.welcome().await;
+    assert_eq!(connected(&mut events).await.conn_id, ConnId(2));
+    p.ws_close(1011, "boom").await;
+    p.finish().await;
+    assert_eq!(disconnected(&mut events).await.retry_in, Some(S * 2));
+    let n = redial(&mut events).await;
+    assert_eq!(
+        (n.conn_id, n.attempt, n.delay, n.cause),
+        (Some(ConnId(2)), 2, S * 2, RedialCause::Failure)
+    );
+
+    // A zero-delay redial (the one immediate retry after 4013) is announced
+    // too, before the dial it schedules reports anything.
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p.error_close(ErrorCode::KEEPALIVE_TIMEOUT, "no pong").await;
+    assert_eq!(
+        disconnected(&mut events).await.retry_in,
+        Some(Duration::ZERO)
+    );
+    let n = redial(&mut events).await;
+    assert_eq!(
+        (n.conn_id, n.attempt, n.delay, n.cause),
+        (Some(ConnId(3)), 3, Duration::ZERO, RedialCause::Failure)
+    );
+    let _p = server.dial().await.welcome().await;
+    assert_eq!(
+        match next_any(&mut events).await {
+            Event::Connected(c) => c.conn_id,
+            other => panic!("expected Connected, got {other:?}"),
+        },
+        ConnId(4)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_redial_after_a_fatal_disconnect() {
+    let (_client, mut events, mut server) = start(builder());
+    server.dial().await.fail_http(403);
+    match next_any(&mut events).await {
+        Event::Disconnected(r) => assert!(r.fatal),
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    let e = tokio::time::timeout(WAIT, events.recv()).await.unwrap();
+    assert!(e.is_none(), "expected the end of events, got {e:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn redial_drain_follows_the_drain_event_with_the_jitter_used() {
+    let (_client, mut events, mut server) = start(builder());
+    // A failure first: the drain replacement still reports attempt 0.
+    drop(server.dial().await);
+    disconnected(&mut events).await;
+    assert_eq!(redial(&mut events).await.attempt, 1);
+    let mut p = server.dial().await.welcome().await;
+    assert_eq!(connected(&mut events).await.conn_id, ConnId(2));
+    p.open(1).await;
+    let _s = stream(&mut events).await;
+    let t = Instant::now();
+    p.drain(None).await;
+    match next_any(&mut events).await {
+        Event::Drain(d) => assert_eq!(d.conn_id, ConnId(2)),
+        other => panic!("expected Drain, got {other:?}"),
+    }
+    let n = redial(&mut events).await;
+    assert_eq!(
+        n,
+        RedialNotice {
+            conn_id: Some(ConnId(2)),
+            attempt: 0,
+            delay: S,
+            cause: RedialCause::Drain,
+        },
+        "rng 0.5 * 2 s jitter"
+    );
+    let d = server.dial().await;
+    assert_eq!(d.at - t, n.delay);
+    let _p3 = d.welcome().await;
+    assert_eq!(connected(&mut events).await.conn_id, ConnId(3));
+
+    // retry_after_ms is reported as given.
+    let (_client, mut events, mut server) = start(builder());
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p.open(1).await;
+    let _s = stream(&mut events).await;
+    p.drain(Some(7000)).await;
+    assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    let n = redial(&mut events).await;
+    assert_eq!(
+        (n.attempt, n.delay, n.cause),
+        (0, S * 7, RedialCause::Drain)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn redial_token_refresh_has_no_disconnected() {
+    let (token, _) = counting_provider();
+    let (_client, mut events, mut server) = start(builder().token(token));
+    server.dial().await.fail_http(401);
+    let n = redial(&mut events).await;
+    assert_eq!(
+        n,
+        RedialNotice {
+            conn_id: Some(ConnId(1)),
+            attempt: 1,
+            delay: Duration::ZERO,
+            cause: RedialCause::TokenRefresh,
+        }
+    );
+    let p = server.dial().await.welcome().await;
+    assert_eq!(p.hello["token"], "t2");
+    match next_any(&mut events).await {
+        Event::Connected(c) => assert_eq!(c.conn_id, ConnId(2)),
+        other => panic!("expected Connected, got {other:?}"),
+    }
+
+    // Also for a 4011 before welcome.
+    let (token, _) = counting_provider();
+    let (_client, mut events, mut server) = start(builder().token(token));
+    let mut p1 = server.dial().await.accept().await;
+    p1.error_close(ErrorCode::UNAUTHORIZED, "expired").await;
+    let n = redial(&mut events).await;
+    assert_eq!(
+        (n.conn_id, n.attempt, n.cause),
+        (Some(ConnId(1)), 1, RedialCause::TokenRefresh)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_redial_on_drain_vetoes_the_replacement() {
+    let (client, mut events, mut server) =
+        start(builder().no_redial_on_drain(DrainReason::Replaced));
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p.open(1).await;
+    let _s = stream(&mut events).await;
+    // retry_after_ms 0 would otherwise dial inside on_drain, before the
+    // application sees the Drain.
+    p.drain_for("replaced", Some(0)).await;
+    match next_any(&mut events).await {
+        Event::Drain(d) => assert_eq!(d.reason, DrainReason::Replaced),
+        other => panic!("expected Drain, got {other:?}"),
+    }
+    server.no_dial(S * 5).await;
+    assert_eq!(client.state(), ClientState::Connected);
+    let closing = {
+        let client = client.clone();
+        tokio::spawn(async move { client.close_immediate("TAKEN_OVER").await })
+    };
+    assert_eq!(p.control().await["code"], 0);
+    assert!(matches!(p.next().await, Got::Close(1000, _)));
+    p.finish().await;
+    closing.await.unwrap();
+    match next_any(&mut events).await {
+        Event::Disconnected(r) => assert_eq!((r.ws_code, r.fatal), (Some(1000), false)),
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    let e = tokio::time::timeout(WAIT, events.recv()).await.unwrap();
+    assert!(e.is_none(), "no Redial, then the end; got {e:?}");
+    server.no_dial(Duration::from_secs(600)).await;
+}
+
+/// The end of events with nothing, not even a `Redial`, before it.
+async fn ended_strictly(events: &mut Events) {
+    let e = tokio::time::timeout(WAIT, events.recv()).await.unwrap();
+    assert!(e.is_none(), "expected the end of events, got {e:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_vetoed_connection_ending_on_its_own_is_final_without_a_redial() {
+    // Its own early 4012 (empty table), with rng 0: GoingAway backoff would
+    // redial at once.
+    let (client, mut events, mut server) =
+        start_with_rng(builder().no_redial_on_drain(DrainReason::Replaced), 0.0);
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p.drain_for("replaced", Some(0)).await;
+    assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    p.error_close(ErrorCode::GOING_AWAY, "draining: replaced")
+        .await;
+    match next_any(&mut events).await {
+        Event::Disconnected(r) => {
+            assert_eq!((r.ws_code, r.fatal, r.retry_in), (Some(4012), false, None))
+        }
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    ended_strictly(&mut events).await;
+    assert_eq!(client.state(), ClientState::Closed);
+    assert!(!client.wait_connected().await.unwrap_err().fatal);
+    server.no_dial(Duration::from_secs(600)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_vetoed_connection_ending_at_its_deadline_is_final_without_a_redial() {
+    let (_client, mut events, mut server) =
+        start_with_rng(builder().no_redial_on_drain(DrainReason::Replaced), 0.0);
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p.open(1).await;
+    let mut s = stream(&mut events).await;
+    p.drain_for("replaced", Some(0)).await;
+    assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    // The server's deadline (30 s) passes with the stream still open: it
+    // resets it and closes 4012.
+    tokio::time::sleep(S * 30).await;
+    p.send(frame::encode_reset(1, ErrorCode::CANCEL, "drain deadline"))
+        .await;
+    p.error_close(ErrorCode::GOING_AWAY, "drain deadline").await;
+    match next_any(&mut events).await {
+        Event::Disconnected(r) => {
+            assert_eq!((r.ws_code, r.fatal, r.retry_in), (Some(4012), false, None))
+        }
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    ended_strictly(&mut events).await;
+    let mut buf = [0u8; 1];
+    assert!(s.read(&mut buf).await.is_err());
+    server.no_dial(Duration::from_secs(600)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_later_drain_on_a_vetoed_connection_dials_nothing() {
+    let (client, mut events, mut server) =
+        start(builder().no_redial_on_drain(DrainReason::Replaced));
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p.open(1).await;
+    let _s = stream(&mut events).await;
+    p.drain_for("replaced", Some(0)).await;
+    p.drain_for("rollout", Some(0)).await;
+    for _ in 0..2 {
+        assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    }
+    server.no_dial(S * 600).await;
+    let closing = tokio::spawn(async move { client.close_immediate("TAKEN_OVER").await });
+    assert_eq!(p.control().await["code"], 0);
+    assert!(matches!(p.next().await, Got::Close(1000, _)));
+    p.finish().await;
+    closing.await.unwrap();
+    assert!(matches!(
+        next_any(&mut events).await,
+        Event::Disconnected(r) if !r.fatal
+    ));
+    ended_strictly(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_vetoed_drain_on_a_retiring_connection_abandons_its_pending_replacement() {
+    // Scheduled: the replacement's timer is cancelled.
+    let (_client, mut events, mut server) =
+        start(builder().no_redial_on_drain(DrainReason::Replaced));
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p.open(1).await;
+    let _s = stream(&mut events).await;
+    p.drain_for("rollout", Some(60_000)).await;
+    assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    assert_eq!(redial(&mut events).await.delay, S * 60);
+    p.drain_for("replaced", Some(0)).await;
+    assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    server.no_dial(S * 600).await;
+    p.error_close(ErrorCode::GOING_AWAY, "drained").await;
+    assert!(matches!(
+        next_any(&mut events).await,
+        Event::Disconnected(r) if !r.fatal && r.retry_in.is_none()
+    ));
+    ended_strictly(&mut events).await;
+
+    // Dialing: the dial in flight is aborted before its upgrade completes.
+    let (_client, mut events, mut server) =
+        start(builder().no_redial_on_drain(DrainReason::Replaced));
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p.open(1).await;
+    let _s = stream(&mut events).await;
+    p.drain_for("rollout", Some(0)).await;
+    assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    assert_eq!(redial(&mut events).await.delay, Duration::ZERO);
+    let mut d2 = server.dial().await;
+    p.drain_for("replaced", Some(0)).await;
+    assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    tokio::time::timeout(WAIT, d2.reply.closed())
+        .await
+        .expect("the replacement dial was not aborted");
+    server.no_dial(S * 600).await;
+    p.error_close(ErrorCode::GOING_AWAY, "drained").await;
+    assert!(matches!(
+        next_any(&mut events).await,
+        Event::Disconnected(r) if r.conn_id == Some(ConnId(1)) && !r.fatal
+    ));
+    ended_strictly(&mut events).await;
+}
+
+/// The next event, which must be a `Disconnected`.
+async fn disconnected_raw(events: &mut Events) -> DisconnectReason {
+    match next_any(events).await {
+        Event::Disconnected(r) => r,
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_vetoed_drain_and_the_close_in_one_read_still_veto() {
+    // Regression guard for the biased select: the drain and the 4012 are
+    // written back to back before the client runs. It exercises that case;
+    // it does not prove both supervisor branches were ready in one poll.
+    let (_client, mut events, mut server) =
+        start_with_rng(builder().no_redial_on_drain(DrainReason::Replaced), 0.0);
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p.drain_for("replaced", Some(0)).await;
+    p.error_close(ErrorCode::GOING_AWAY, "draining: replaced")
+        .await;
+    assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    let r = disconnected_raw(&mut events).await;
+    assert_eq!((r.fatal, r.retry_in), (false, None), "{r:?}");
+    ended_strictly(&mut events).await;
+    server.no_dial(Duration::from_secs(600)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_replacement_waiting_for_welcome_abandoned_by_a_veto_is_closed_with_no_error() {
+    let (_client, mut events, mut server) =
+        start(builder().no_redial_on_drain(DrainReason::Replaced));
+    let mut p1 = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p1.open(1).await;
+    let _s = stream(&mut events).await;
+    p1.drain_for("rollout", Some(0)).await;
+    assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    assert_eq!(redial(&mut events).await.delay, Duration::ZERO);
+    // The replacement has sent hello; the server holds its welcome.
+    let mut p2 = server.dial().await.accept().await;
+    let t = Instant::now();
+    p1.drain_for("replaced", Some(0)).await;
+    let e = p2.control().await;
+    assert_eq!(
+        (e["t"].as_str(), e["code"].as_u64()),
+        (Some("error"), Some(0)),
+        "{e}"
+    );
+    assert!(matches!(p2.next().await, Got::Close(1000, _)));
+    assert!(t.elapsed() < S, "closed promptly, not at client exit");
+    p2.finish().await;
+    assert!(matches!(
+        next_any(&mut events).await,
+        Event::Drain(d) if d.reason == DrainReason::Replaced
+    ));
+    p1.error_close(ErrorCode::GOING_AWAY, "drained").await;
+    let r = disconnected_raw(&mut events).await;
+    assert_eq!(
+        (r.conn_id, r.fatal, r.retry_in),
+        (Some(ConnId(1)), false, None),
+        "no Connected or Disconnected for the abandoned replacement"
+    );
+    ended_strictly(&mut events).await;
+    server.no_dial(Duration::from_secs(600)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_welcomed_replacement_abandoned_by_a_veto_is_closed_at_once() {
+    let (_client, mut events, mut server) =
+        start(builder().no_redial_on_drain(DrainReason::Replaced));
+    let mut p1 = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p1.open(1).await;
+    let _s = stream(&mut events).await;
+    p1.drain_for("rollout", Some(0)).await;
+    assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    assert_eq!(redial(&mut events).await.delay, Duration::ZERO);
+    let mut p2 = server.dial().await.accept().await;
+    // The replacement's welcome and the vetoed drain on the old connection
+    // land before the supervisor runs again: the dial has finished its
+    // handshake when the veto abandons it.
+    p2.welcome().await;
+    p1.drain_for("replaced", Some(0)).await;
+    let t = Instant::now();
+    let e = p2.control().await;
+    assert_eq!(
+        (e["t"].as_str(), e["code"].as_u64()),
+        (Some("error"), Some(0))
+    );
+    assert!(matches!(p2.next().await, Got::Close(1000, _)));
+    assert!(t.elapsed() < S, "closed promptly, not at client exit");
+    // No Connected for it: only the vetoed drain.
+    assert!(matches!(
+        next_any(&mut events).await,
+        Event::Drain(d) if d.reason == DrainReason::Replaced
+    ));
+    p1.error_close(ErrorCode::GOING_AWAY, "drained").await;
+    let r = disconnected_raw(&mut events).await;
+    assert_eq!(
+        (r.conn_id, r.fatal, r.retry_in),
+        (Some(ConnId(1)), false, None)
+    );
+    ended_strictly(&mut events).await;
+    server.no_dial(Duration::from_secs(600)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_vetoed_drain_lost_to_a_full_backlog_still_ends_without_a_redial() {
+    // max_streams 64: the backlog limit is max(128, 64 + 64) = 128 events.
+    let (_client, mut events, mut server) = start(
+        builder()
+            .max_streams(64)
+            .no_redial_on_drain(DrainReason::Replaced),
+    );
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    for i in 0..64 {
+        p.open(2 * i + 1).await;
+        p.send_json(json!({"t": "app", "body": {"i": i}})).await;
+    }
+    // Event 129: dropped, and the connection fails with ENHANCE_YOUR_CALM.
+    p.drain_for("replaced", Some(0)).await;
+    loop {
+        match p.next().await {
+            Got::Close(code, _) => {
+                assert_eq!(code, 4009);
+                break;
+            }
+            Got::End => panic!("closed without a close frame"),
+            _ => {}
+        }
+    }
+    p.finish().await;
+    let mut kept = Vec::new();
+    let r = loop {
+        match next_any(&mut events).await {
+            Event::Disconnected(r) => break r,
+            e => kept.push(e),
+        }
+    };
+    assert_eq!(kept.len(), 128);
+    assert!(
+        !kept
+            .iter()
+            .any(|e| matches!(e, Event::Drain(_) | Event::Redial(_))),
+        "the drain was dropped"
+    );
+    assert_eq!(
+        (r.ws_code, r.fatal, r.retry_in),
+        (Some(4009), false, None),
+        "{r:?}"
+    );
+    drop(kept);
+    ended_strictly(&mut events).await;
+    server.no_dial(Duration::from_secs(600)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_vetoed_connection_ends_non_fatal_even_with_reconnect_disabled() {
+    let (_client, mut events, mut server) = start(
+        builder()
+            .reconnect(ReconnectPolicy::disabled())
+            .no_redial_on_drain(DrainReason::Replaced),
+    );
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p.drain_for("replaced", None).await;
+    assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    p.error_close(ErrorCode::GOING_AWAY, "draining: replaced")
+        .await;
+    let r = disconnected_raw(&mut events).await;
+    assert_eq!((r.ws_code, r.fatal, r.retry_in), (Some(4012), false, None));
+    ended_strictly(&mut events).await;
+    server.no_dial(Duration::from_secs(600)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_redial_on_drain_only_vetoes_its_reasons() {
+    // Without the veto a replaced drain is an ordinary hand-over.
+    let (_client, mut events, mut server) = start(builder());
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p.open(1).await;
+    let _s = stream(&mut events).await;
+    let t = Instant::now();
+    p.drain_for("replaced", Some(0)).await;
+    assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    let n = redial(&mut events).await;
+    assert_eq!((n.cause, n.delay), (RedialCause::Drain, Duration::ZERO));
+    assert_eq!(server.dial().await.at, t);
+
+    // A veto for another reason leaves rollout alone.
+    let (_client, mut events, mut server) =
+        start(builder().no_redial_on_drain(DrainReason::Replaced));
+    let mut p = server.dial().await.welcome().await;
+    connected(&mut events).await;
+    p.open(1).await;
+    let _s = stream(&mut events).await;
+    p.drain(Some(0)).await;
+    assert!(matches!(next_any(&mut events).await, Event::Drain(_)));
+    assert_eq!(redial(&mut events).await.cause, RedialCause::Drain);
+    server.dial().await;
+}
+
+// --- agent overrides -------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn agent_runtime_and_os_overrides_reach_hello() {
+    let (_client, _events, mut server) = start(
+        builder()
+            .agent_runtime("tauri/2.1")
+            .agent_os("windows/x86_64"),
+    );
+    let p = server.dial().await.accept().await;
+    assert_eq!(
+        p.hello["agent"],
+        json!({
+            "sdk": "ws-mixer-rust",
+            "sdk_version": crate::SDK_VERSION,
+            "runtime": "tauri/2.1",
+            "os": "windows/x86_64",
+        })
+    );
+
+    // Defaults when not overridden; overriding one keeps the other.
+    let (_client, _events, mut server) = start(builder().agent_os("linux/arm"));
+    let p = server.dial().await.accept().await;
+    assert_eq!(p.hello["agent"]["runtime"], "rust");
+    assert_eq!(p.hello["agent"]["os"], "linux/arm");
+    let (_client, _events, mut server) = start(builder());
+    let p = server.dial().await.accept().await;
+    assert_eq!(
+        p.hello["agent"]["os"],
+        format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH)
+    );
+}
+
 // --- events, state, meta, stats ---------------------------------------------
 
 #[tokio::test(start_paused = true)]
@@ -1026,6 +1682,7 @@ async fn one_disconnected_per_connection_in_order() {
             Event::App(a) => (a.conn_id, "app"),
             Event::Drain(d) => (d.conn_id, "drain"),
             Event::Disconnected(r) => (r.conn_id.unwrap(), "disconnected"),
+            Event::Redial(_) => continue,
         };
         per_conn.entry(id).or_default().push(kind);
     }
@@ -1184,6 +1841,14 @@ async fn connect_validates_the_configuration() {
     ));
     assert!(matches!(
         err(builder().agent("", "1")),
+        BuildError::InvalidAgent(_)
+    ));
+    assert!(matches!(
+        err(builder().agent_runtime("")),
+        BuildError::InvalidAgent(_)
+    ));
+    assert!(matches!(
+        err(builder().agent_os("x".repeat(129))),
         BuildError::InvalidAgent(_)
     ));
     assert!(matches!(

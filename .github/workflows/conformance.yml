@@ -89,3 +89,47 @@ jobs:
           name: conformance-pair
           path: build/*.xml
           if-no-files-found: warn
+
+  # ws-mixer-mcpwarp's runners for spec/fixtures/mcpwarp, against the
+  # ws-mixer-spec tag in spec.pin (make fetch-spec, run by the target).
+  mcpwarp-fixtures:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: run mcpwarp fixture runners (with test-util)
+        shell: bash
+        run: |
+          mkdir -p build
+          make mcpwarp-fixtures 2>&1 | tee build/mcpwarp-fixtures.log
+      # The runners assert their own minimums; this also fails a run where the
+      # tunnel runner was compiled without test-util and only printed
+      # "skipped", or where a count line is missing.
+      - name: guard (mcpwarp floors)
+        shell: bash
+        run: |
+          log=build/mcpwarp-fixtures.log
+          fail() { echo "$1" >&2; exit 1; }
+          if grep -qF 'tunnel: skipped' "$log"; then
+            fail "tunnel runner skipped: built without test-util"
+          fi
+          count() { sed -nE "s|.*$1.*|\1|p" "$log" | tail -1; }
+          check() {
+            [ -n "$2" ] || fail "$1: no count line in the log"
+            [ "$2" -ge "$3" ] || fail "$1: $2 below floor $3"
+            echo "$1: $2 (floor $3)"
+          }
+          check tunnel "$(count 'tunnel ([0-9]+)/[0-9]+')" 34
+          check bridging "$(count 'bridging ([0-9]+)/[0-9]+')" 13
+          check envelope "$(count 'envelope ([0-9]+) \(')" 60
+          check envelope-asserted "$(count 'envelope [0-9]+ \(([0-9]+) asserted')" 46
+          check status-text-entries "$(count 'status-text table entries: ([0-9]+)')" 102
+          check status-text-cases "$(count 'status-text cases: ([0-9]+)')" 26
+          grep -qF 'status-text rules: checked' "$log" || fail "status-text rules did not run"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mcpwarp-fixtures
+          path: build/mcpwarp-fixtures.log
+          if-no-files-found: warn

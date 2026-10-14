@@ -1,11 +1,11 @@
 [workspace]
-members = [".", "conformance/adapter"]
-default-members = ["."]
+members = [".", "conformance/adapter", "ws-mixer-mcpwarp"]
+default-members = [".", "ws-mixer-mcpwarp"]
 resolver = "3"
 
 [package]
 name = "ws-mixer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Rust client SDK for the ws-mixer.v1 protocol: N byte streams multiplexed over one WebSocket"
@@ -15,7 +15,7 @@ documentation = "https://docs.rs/ws-mixer"
 readme = "README.md"
 keywords = ["websocket", "multiplexing", "tunnel", "tokio", "mcp"]
 categories = ["network-programming", "asynchronous", "web-programming::websocket"]
-exclude = ["/.github", "/conformance", "/.spec", "/.goserver", "/build", "Makefile", "*.pin", "BRIEF.md", ".mcp.json", "/.claude", "deny.toml", "clippy.toml"]
+exclude = ["/.github", "/conformance", "/ws-mixer-mcpwarp", "/.spec", "/.goserver", "/build", "Makefile", "*.pin", "BRIEF.md", ".mcp.json", "/.claude", "deny.toml", "clippy.toml"]
 
 [lib]
 name = "ws_mixer"
