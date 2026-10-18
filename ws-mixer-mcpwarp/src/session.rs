@@ -265,6 +265,9 @@ pub struct Session {
     overload_timer: Option<(TimerId, Outbound)>,
     unregister_wait: Option<TimerId>,
     next_timer: u64,
+    /// A `disable` (id, reason) that arrived before any server id was known;
+    /// applied if the next `registered` carries that id.
+    pending_disable: Option<(String, String)>,
 
     /// The newest welcomed connection.
     live: Option<ConnId>,
@@ -298,6 +301,7 @@ impl Session {
             overload_timer: None,
             unregister_wait: None,
             next_timer: 0,
+            pending_disable: None,
             live: None,
             draining: None,
             superseded: HashSet::new(),
@@ -332,8 +336,9 @@ impl Session {
         self.url.as_deref()
     }
 
-    /// The latest server id, from `registered`, `disable`, `enable` or
-    /// `SERVER_DISABLED`.
+    /// The latest server id, from `registered`, `enable` or
+    /// `SERVER_DISABLED`. A `disable` never introduces one: it applies only
+    /// to the known id, or is held until `registered` names it.
     pub fn server_id(&self) -> Option<&str> {
         self.server_id.as_deref()
     }
@@ -423,17 +428,21 @@ impl Session {
         false
     }
 
-    /// `conn` ended, or a dial for it failed. Returns `true` when that leaves
-    /// the session alone (MCPWARP.md §5.9 Disconnect, §6.7 T29/T38): a
-    /// superseded connection, or a replacement's failed dial while the
-    /// drained connection still serves. Otherwise the session is back to
-    /// `connecting` (T30, T44), a pending register retry cancelled.
+    /// `conn` ended, or a dial for it failed. Decided by connection identity
+    /// (MCPWARP.md §5.9 Disconnect, §6.8 Drain), never by state: returns
+    /// `true` and leaves the session alone for a superseded connection, or
+    /// for one it never saw welcomed while another is live (a replacement's
+    /// failed dial while the drained connection still serves, T29; on a
+    /// shared client, a connection that ended before this session existed).
+    /// Otherwise the session is back to `connecting` (T30, T44), a pending
+    /// register retry cancelled and a held `disable` dropped. A failure with
+    /// no conn id needs no call.
     pub fn on_disconnected(&mut self, conn: ConnId) -> bool {
         if self.superseded.remove(&conn) {
             return true;
         }
         let welcomed = self.live == Some(conn) || self.draining == Some(conn);
-        if self.draining.is_some() && !welcomed {
+        if !welcomed && self.live.is_some() {
             return true;
         }
         if self.draining == Some(conn) {
@@ -442,6 +451,7 @@ impl Session {
         if self.live == Some(conn) {
             self.live = None;
         }
+        self.pending_disable = None;
         if self.is_ending() {
             return false;
         }
@@ -466,6 +476,7 @@ impl Session {
         let was_registered = self.connected && self.sent_register_this_conn;
         self.set_state(ExposeState::Closing);
         self.cancel_timers();
+        self.pending_disable = None;
         if !was_registered {
             self.push(Command::CloseGraceful);
             return;
@@ -490,6 +501,7 @@ impl Session {
         self.set_state(ExposeState::Closing);
         self.cancel_timers();
         self.outstanding = None;
+        self.pending_disable = None;
         self.push(Command::CloseGraceful);
     }
 
@@ -570,19 +582,20 @@ impl Session {
                 if self.is_ending() || self.taken_over {
                     return;
                 }
-                if self.server_id.as_ref().is_none_or(|s| *s == id) {
-                    self.server_id = Some(id);
-                    self.set_state(ExposeState::Disabled);
-                    self.emit(SessionEvent::Disabled {
-                        server_id: self.server_id.clone(),
-                        reason,
-                    });
+                match &self.server_id {
+                    Some(known) if *known == id => self.apply_disable(reason),
+                    Some(_) => {}
+                    // The edge sends `disable` to every connection of the
+                    // owner, so before our `registered` the id may be another
+                    // service's: held until `registered` says (latest wins).
+                    None => self.pending_disable = Some((id, reason)),
                 }
             }
             InboundEnvelope::Enable { id, name } => {
                 if self.is_ending() || self.taken_over || name != self.name {
                     return;
                 }
+                self.pending_disable = None;
                 self.server_id = Some(id.clone());
                 self.set_state(ExposeState::Registering);
                 self.emit(SessionEvent::Enabled { server_id: id });
@@ -629,6 +642,11 @@ impl Session {
             self.ever_registered = true;
             self.set_state(ExposeState::Registered);
             self.emit(SessionEvent::Registered(reg));
+            if let Some((id, reason)) = self.pending_disable.take() {
+                if self.server_id.as_ref() == Some(&id) {
+                    self.apply_disable(reason);
+                }
+            }
             return;
         }
         let Some(err) = errors.into_iter().find(|e| e.name == self.name) else {
@@ -636,6 +654,8 @@ impl Session {
         };
         self.outstanding = None;
         if err.code == RegisterErrorCode::ServerDisabled {
+            // Disabled either way; one `disabled` event.
+            self.pending_disable = None;
             if err.id.is_some() {
                 self.server_id = err.id;
             }
@@ -728,6 +748,7 @@ impl Session {
     fn take_over(&mut self, conflict: Conflict) {
         self.taken_over = true;
         self.outstanding = None;
+        self.pending_disable = None;
         // The edge no longer holds the name for this connection: close has
         // nothing to unregister.
         self.sent_register_this_conn = false;
@@ -736,6 +757,15 @@ impl Session {
         self.emit(SessionEvent::Conflict(conflict));
         self.push(Command::CloseImmediate {
             message: TAKEN_OVER_MESSAGE.into(),
+        });
+    }
+
+    /// A `disable` for the known server id.
+    fn apply_disable(&mut self, reason: String) {
+        self.set_state(ExposeState::Disabled);
+        self.emit(SessionEvent::Disabled {
+            server_id: self.server_id.clone(),
+            reason,
         });
     }
 

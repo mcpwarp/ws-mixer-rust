@@ -21,7 +21,7 @@ use tower_service::Service;
 use ws_mixer::BoxError;
 
 use super::handler::RequestBody;
-use super::response::{HOP_BY_HOP, connection_tokens, sdk_reply_response};
+use super::response::{HOP_BY_HOP, SdkReply, connection_tokens, sdk_reply_response};
 
 /// How long a [`Target`] waits for the local server's response headers by
 /// default: 30 s (`targetTimeoutMs`, MCPWARP.md §5.1).
@@ -90,6 +90,63 @@ impl http_body::Body for TargetBody {
 )]
 pub struct TargetUrlError(());
 
+/// Why a [`Target`] answered for the local server (MCPWARP.md §4.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TargetReply {
+    /// `502 local server unreachable[ (<code>)]`; `code` is the I/O cause
+    /// code (`ECONNREFUSED`, ...) when known.
+    #[non_exhaustive]
+    Unreachable {
+        /// The Node-style code of the I/O error, as in the reply's message.
+        code: Option<&'static str>,
+    },
+    /// `504 local server timed out`.
+    Timeout,
+}
+
+impl TargetReply {
+    /// The reply's status: `502` or `504`.
+    pub fn status(&self) -> http::StatusCode {
+        match self {
+            Self::Unreachable { .. } => http::StatusCode::BAD_GATEWAY,
+            Self::Timeout => http::StatusCode::GATEWAY_TIMEOUT,
+        }
+    }
+}
+
+/// The [`TargetReply`] behind `res`, whatever its body type, as long as the
+/// response still carries the tag: a layer that rebuilds the response drops
+/// it; in-place edits (a header added, the status changed) keep it. `None`
+/// for the local server's own responses and anything else.
+///
+/// ```no_run
+/// use tower_service::Service;
+/// use ws_mixer_mcpwarp::bridge::{Target, TargetReply, handler_fn, target_reply};
+///
+/// # fn run(target: Target) {
+/// let app = handler_fn(move |req: http::Request<_>| {
+///     let mut target = target.clone();
+///     async move {
+///         let res = target.call(req).await?;
+///         if let Some(TargetReply::Unreachable { code, .. }) = target_reply(&res) {
+///             eprintln!("local server down: {code:?}");
+///         }
+///         Ok(res)
+///     }
+/// });
+/// # let _ = app;
+/// # }
+/// ```
+pub fn target_reply<B>(res: &Response<B>) -> Option<TargetReply> {
+    let tag = res.extensions().get::<SdkReply>()?;
+    match tag.status {
+        502 => Some(TargetReply::Unreachable { code: tag.code }),
+        504 => Some(TargetReply::Timeout),
+        _ => None,
+    }
+}
+
 /// A local HTTP server requests are forwarded to.
 ///
 /// A `Target` is a [`Handler`](super::Handler) for
@@ -112,7 +169,7 @@ pub struct TargetUrlError(());
 /// status or body changed, e.g. by a middleware layer) is written as an
 /// ordinary app response, edits included. Removing the tag (clearing the
 /// response's extensions) is fine too: the response is then an app
-/// response as well.
+/// response as well. [`target_reply`] reads the tag, edited or not.
 ///
 /// Cloning is cheap and shares the connection pool.
 ///
@@ -317,13 +374,14 @@ async fn forward(
 ) -> Result<Response<TargetBody>, BoxError> {
     let upstream = upstream_request(inner, req)?;
     match tokio::time::timeout(inner.timeout, inner.client.request(upstream)).await {
-        Err(_) => Ok(sdk_reply_response(504, "local server timed out").map(TargetBody)),
+        Err(_) => Ok(sdk_reply_response(504, "local server timed out", None).map(TargetBody)),
         Ok(Err(e)) => {
-            let message = match cause_code(&e) {
+            let code = cause_code(&e);
+            let message = match code {
                 Some(code) => format!("local server unreachable ({code})"),
                 None => "local server unreachable".into(),
             };
-            Ok(sdk_reply_response(502, &message).map(TargetBody))
+            Ok(sdk_reply_response(502, &message, code).map(TargetBody))
         }
         Ok(Ok(res)) => Ok(res.map(TargetBody::new)),
     }
@@ -463,6 +521,14 @@ mod tests {
             reply_of(&res),
             (502, "local server unreachable (ECONNREFUSED)".into())
         );
+        let cause = target_reply(&res).unwrap();
+        assert_eq!(
+            cause,
+            TargetReply::Unreachable {
+                code: Some("ECONNREFUSED")
+            }
+        );
+        assert_eq!(cause.status(), http::StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -476,7 +542,53 @@ mod tests {
         let hold = tokio::spawn(async move { listener.accept().await });
         let res = t.call(req("/mcp")).await.unwrap();
         assert_eq!(reply_of(&res), (504, "local server timed out".into()));
+        assert_eq!(target_reply(&res), Some(TargetReply::Timeout));
+        assert_eq!(
+            TargetReply::Timeout.status(),
+            http::StatusCode::GATEWAY_TIMEOUT
+        );
         hold.abort();
+    }
+
+    #[tokio::test]
+    async fn target_reply_survives_edits_not_rebuilds() {
+        let plain = Response::new(TargetBody::empty());
+        assert_eq!(target_reply(&plain), None);
+        let (addr, server) = answering_server("ok").await;
+        let res = target(&format!("http://{addr}/mcp"))
+            .call(req("/mcp"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(target_reply(&res), None, "the local server's own response");
+        server.abort();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let mut res = target(&format!("http://{addr}/mcp"))
+            .call(req("/mcp"))
+            .await
+            .unwrap();
+        res.headers_mut()
+            .insert("access-control-allow-origin", HeaderValue::from_static("*"));
+        *res.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
+        let want = Some(TargetReply::Unreachable {
+            code: Some("ECONNREFUSED"),
+        });
+        assert_eq!(target_reply(&res), want);
+        let (parts, body) = res.into_parts();
+        let mapped = Response::from_parts(parts, TargetBody::new(body));
+        assert_eq!(
+            target_reply(&mapped),
+            want,
+            "same extensions, new body type"
+        );
+        let rebuilt = Response::builder()
+            .status(mapped.status())
+            .body(())
+            .unwrap();
+        assert_eq!(target_reply(&rebuilt), None);
     }
 
     /// Answers every connection with `200` and `body` after reading the head.

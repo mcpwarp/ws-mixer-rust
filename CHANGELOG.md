@@ -7,8 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Planned as 0.2.0, the first published release. Implements the client role of ws-mixer spec
-v0.6.1; conformance 24/24 client fixtures and 10/10 pair scenarios against ws-mixer-go v0.8.0.
+0.2.0 will be published from main after this pin bump; the `ws-mixer-v0.2.0` tag predates it.
+
+### Changed
+
+- After the `ws-mixer-v0.2.0` tag the pins moved on to spec v0.6.2 and ws-mixer-go v0.9.0, with
+  the same results (24/24, 10/10) and no code change.
+
+## 0.2.0 (tagged `ws-mixer-v0.2.0`, not yet published)
+
+The first release to be published. Implements the client role of ws-mixer spec v0.6.1;
+conformance 24/24 client fixtures and 10/10 pair scenarios against ws-mixer-go v0.8.0.
 
 ### Added
 

@@ -1,6 +1,6 @@
 # ws-mixer
 
-Rust client SDK for the [ws-mixer.v1](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.1/docs/WIRE.md)
+Rust client SDK for the [ws-mixer.v1](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.2/docs/WIRE.md)
 protocol: many independent, flow-controlled byte streams multiplexed over one WebSocket.
 
 The server opens streams; the client accepts each one as a `Stream` implementing tokio's
@@ -15,14 +15,14 @@ server side) and [ws-mixer-js](https://github.com/mcpwarp/ws-mixer-js) (Node cli
 
 ## Status
 
-0.2.0, not yet released. Implements the client role of spec **v0.6.1** (`spec.pin`). The spec
+0.2.0, not yet released. Implements the client role of spec **v0.6.2** (`spec.pin`). The spec
 runner's conformance suite passes in full:
 
 - fixture mode: 24/24 client fixtures
-- pair mode: 10/10 scenarios with ws-mixer-go **v0.8.0** (`goserver.pin`) as the server
+- pair mode: 10/10 scenarios with ws-mixer-go **v0.9.0** (`goserver.pin`) as the server
 
-Floors are checked in at `conformance/COUNTS.json`. Fixtures from the upcoming spec v0.6.2 and
-v0.6.3 (not tagged yet) are picked up when `spec.pin` moves.
+Floors are checked in at `conformance/COUNTS.json`. Fixtures from the upcoming spec v0.6.3 (not
+tagged yet) are picked up when `spec.pin` moves.
 
 New in 0.2.0: additive API, with the close and drain behaviour changes listed under "Changed" in
 the CHANGELOG:
@@ -42,7 +42,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the details.
 | Crate | Path | Version | What |
 |---|---|---|---|
 | `ws-mixer` | `/` | 0.2.0 | this crate: the ws-mixer.v1 client |
-| [`ws-mixer-mcpwarp`](ws-mixer-mcpwarp/) | `ws-mixer-mcpwarp/` | 0.1.0 | the mcpwarp layer on top |
+| [`ws-mixer-mcpwarp`](ws-mixer-mcpwarp/) | `ws-mixer-mcpwarp/` | 0.1.1 | the mcpwarp layer on top |
 | `ws-mixer-conformance-adapter` | `conformance/adapter/` | not published | the spec runner's adapter |
 
 Each published crate has its own README, CHANGELOG, LICENSE and NOTICE, and is released on its
@@ -51,13 +51,13 @@ own (see [Releasing](#releasing)).
 ## mcpwarp layer
 
 [`ws-mixer-mcpwarp`](ws-mixer-mcpwarp/README.md) implements
-[MCPWARP.md](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.1/docs/MCPWARP.md) §2-§8 of spec
-v0.6.1 on this crate: expose a local MCP server at a public mcpwarp URL. It offers `expose()`
+[MCPWARP.md](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.2/docs/MCPWARP.md) §2-§8 of spec
+v0.6.2 on this crate: expose a local MCP server at a public mcpwarp URL. It offers `expose()`
 (one service, one call), `Tunnel` (a controller for apps with a settings UI, with status text in
 six locales) and the Tier 1 building blocks (envelope, codes, identity, the sans-IO registration
 machine, request bridging) for agents that run their own `ws_mixer::Client`. It passes every
-agent-side mcpwarp fixture set of the spec: envelope 60 (46 asserted, 14 edge-runner only),
-bridging 13 of 14 (one applies only to streamed request bodies), tunnel 34/34, status text 102
+agent-side mcpwarp fixture set of the spec: envelope 63 (49 asserted, 14 edge-runner only),
+bridging 13 of 14 (one applies only to streamed request bodies), tunnel 36/36, status text 102
 table entries and 26 cases.
 
 ## Install
@@ -193,8 +193,8 @@ make conformance-pair      # spec runner, ws-mixer-go server x this client (need
 cargo deny check           # licenses, advisories, duplicate crates
 ```
 
-`make fetch-spec` and `make fetch-goserver` shallow-clone ws-mixer-spec at `spec.pin` (v0.6.1)
-into `.spec/` and ws-mixer-go at `goserver.pin` (v0.8.0) into `.goserver/`, re-cloning when the
+`make fetch-spec` and `make fetch-goserver` shallow-clone ws-mixer-spec at `spec.pin` (v0.6.2)
+into `.spec/` and ws-mixer-go at `goserver.pin` (v0.9.0) into `.goserver/`, re-cloning when the
 pin changes; the conformance targets do this on their own. The spec fixture tests look in
 `$WSMIXER_SPEC_DIR`, then `.spec/` (ws-mixer also tries `../ws-mixer-spec`), and are skipped when
 none exists; ws-mixer-mcpwarp's fail instead when `CI` is set.
@@ -219,11 +219,22 @@ How a desktop host that exposes several local MCP servers should use the mcpwarp
 - **One `session::Session` per service.** On every `Connected`, call `on_welcome` on each session
   and execute the `Command::SendApp` commands it queues (that is the `register`); do not call
   `encode_register` yourself. Feed every session the same transport events (`on_app`,
-  `on_drain`, `on_disconnected`); a session ignores envelopes for other names.
+  `on_drain`, `on_disconnected`); a session ignores envelopes for other names. A session created
+  while a connection is already live needs `on_welcome(<live conn>)` from you; it is not
+  retroactive.
 - **Handle a session's close commands per service.** `Command::Fatal` and
   `Command::CloseGraceful` mean "close the client" for a single-service agent. On a shared
   client, treat them as the end of that one service: drop or reset its session and stop routing
   its host, and keep the connection open for the others.
+- **A `conflict` is per service, a `drain{replaced}` per connection.** The `Conflict` event's
+  reason (or `on_drain` returning `true`) tells them apart. `"replaced"`: every session on the
+  connection is in conflict; close the client at once with `Client::close_immediate` and never
+  redial (`Identity::apply` already vetoes the replacement dial). Any other reason
+  (`"taken_over"`): that one service lost its name to another install; keep the connection and
+  the other services, ignore that session's `Command::CloseImmediate`, send no `unregister` for
+  it, and never `register` the name again until the user reconfigures it. Its `Host` must get
+  `RESET CANCEL`, not a response: return `ServeState::new(..).conflict(true)` for it from
+  `ServeContext::state_for_request`.
 - **The integration id is one constant product UUID**, the same on every install, passed to
   `Identity::new`. It is not a per-user or per-install value.
 - **Only `/mcp` is forwarded.** `serve_stream` answers every other path `404`; a child server
@@ -232,14 +243,16 @@ How a desktop host that exposes several local MCP servers should use the mcpwarp
   child by `req.uri().host()` (each service has its own public host) and calls that child's
   `Target`, cached per child and cloned per request (clones share the connection pool). The
   ws-mixer-mcpwarp README has the full snippet.
-- **A child that is down is the handler's `503`, not the SDK's.** `ServeContext`'s
-  `RegistrationState::Unavailable` answers `503 {"error":"service unavailable"}` for every
-  service on the connection. While one child restarts, return your own `503` with a
-  `Retry-After` header from the handler for that host only, and leave the context `Registered`.
+- **Availability is per `Host`.** `ServeContext::state_for_request` reads the state per request,
+  after the head and before the body: return `Disabled` for a paused service and `Unavailable`
+  while its child restarts, `Registered` for the rest, and `serve_stream` answers that host's
+  `503` before reading the body. Answer your own `503` from the handler only when you need a
+  `Retry-After` header; `bridge::target_reply` tells you a `Target` found its child down.
 - **Features: keep the defaults** (`target`, `rustls-platform-verifier`, `ring`). Do not enable
   `aws-lc-rs`. The SDK always passes an explicit rustls provider, so an `aws-lc-rs` that arrives
   through another dependency (common in Tauri) coexists with `ring` without the process-default
-  panic.
+  panic. ws-mixer-mcpwarp also turns on `serde_json/preserve_order` for the whole graph
+  (`cargo tree -e features -i serde_json | grep preserve_order` shows whether it was already on).
 
 ## Releasing
 

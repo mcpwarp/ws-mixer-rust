@@ -42,7 +42,9 @@ use ws_mixer::{ErrorCode, Stream};
 
 pub use handler::{Handler, HandlerFn, RequestBody, handler_fn};
 #[cfg(feature = "target")]
-pub use target::{DEFAULT_TARGET_TIMEOUT, Target, TargetBody, TargetUrlError};
+pub use target::{
+    DEFAULT_TARGET_TIMEOUT, Target, TargetBody, TargetReply, TargetUrlError, target_reply,
+};
 pub use ws_mixer::BoxError;
 
 use handler::Outcome;
@@ -113,18 +115,54 @@ impl From<RegistrationState> for ServeState {
     }
 }
 
+/// What the agent knows about a request once its head is parsed (MCPWARP.md
+/// §4.2), before any body byte is read: what
+/// [`ServeContext::state_for_request`] decides by.
+///
+/// The strings are the head's bytes decoded as Latin-1, one char per byte:
+/// a raw UTF-8 `café` reads `caf\u{c3}\u{a9}`.
+#[derive(Debug)]
+pub struct RequestInfo<'a> {
+    host: &'a str,
+    method: &'a str,
+    target: &'a str,
+}
+
+impl RequestInfo<'_> {
+    /// The `Host` header as received, case and port kept: compare hosts
+    /// case-insensitively.
+    pub fn host(&self) -> &str {
+        self.host
+    }
+
+    /// The method as received.
+    pub fn method(&self) -> &str {
+        self.method
+    }
+
+    /// The path and query as received, not the escaped form the handler's
+    /// URI carries. An absolute-form target is reduced to its path and
+    /// query, and its fragment is dropped.
+    pub fn target(&self) -> &str {
+        self.target
+    }
+}
+
 type StateFn = dyn Fn() -> ServeState + Send + Sync;
+type RequestStateFn = dyn Fn(&RequestInfo<'_>) -> ServeState + Send + Sync;
 type ErrorFn = dyn Fn(BoxError) + Send + Sync;
 
 /// What [`serve_stream`] needs to know about the agent: its state (read
 /// when the stream arrives for the conflict check and again after the head
-/// for availability), the body cap, the head deadline, and where non-fatal
-/// errors go.
+/// for availability, or per request with
+/// [`state_for_request`](Self::state_for_request)), the body cap, the head
+/// deadline, and where non-fatal errors go.
 ///
 /// Cloning is cheap; clones share the callbacks.
 #[derive(Clone)]
 pub struct ServeContext {
     state: Arc<StateFn>,
+    request_state: Option<Arc<RequestStateFn>>,
     on_error: Option<Arc<ErrorFn>>,
     max_request_body_bytes: u64,
     head_deadline: Duration,
@@ -135,6 +173,7 @@ impl fmt::Debug for ServeContext {
         f.debug_struct("ServeContext")
             .field("max_request_body_bytes", &self.max_request_body_bytes)
             .field("head_deadline", &self.head_deadline)
+            .field("state_for_request", &self.request_state.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -146,10 +185,46 @@ impl ServeContext {
     pub fn new(state: impl Fn() -> ServeState + Send + Sync + 'static) -> Self {
         Self {
             state: Arc::new(state),
+            request_state: None,
             on_error: None,
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             head_deadline: HEAD_DEADLINE,
         }
+    }
+
+    /// Per-request state read after the head and before the body, in place
+    /// of the state given to [`new`](Self::new), which is then read only
+    /// when the stream arrives (the §4.4 row 0 check). For a host serving
+    /// several services on one client, routing by `Host`: a paused service
+    /// gets its `503` (row 3) before its body is read, so an oversized body
+    /// is not answered `413` (row 4) first.
+    ///
+    /// Called once the head parses, whatever the path; not called for a bad
+    /// head. A state with `conflict` set resets the stream with `CANCEL`
+    /// without reading the body, as row 0 does, on any path (row 0 beats
+    /// the `404`). Otherwise its `registration` decides the `503` once the
+    /// path is [`MCP_PATH`].
+    ///
+    /// The closure runs synchronously on the serving task: keep it cheap
+    /// and never block.
+    ///
+    /// ```
+    /// use ws_mixer_mcpwarp::bridge::{RegistrationState, ServeContext};
+    ///
+    /// let ctx = ServeContext::new(|| RegistrationState::Registered.into())
+    ///     .state_for_request(|req| match req.host() {
+    ///         "paused.example" => RegistrationState::Disabled.into(),
+    ///         _ => RegistrationState::Registered.into(),
+    ///     });
+    /// # let _ = ctx;
+    /// ```
+    #[must_use]
+    pub fn state_for_request(
+        mut self,
+        f: impl Fn(&RequestInfo<'_>) -> ServeState + Send + Sync + 'static,
+    ) -> Self {
+        self.request_state = Some(Arc::new(f));
+        self
     }
 
     /// Sets the request body cap (`maxRequestBodyBytes`): a larger body is
@@ -199,7 +274,9 @@ impl ServeContext {
 /// Precedence (§4.4), first match answers:
 ///
 /// 0. `conflict`: `RESET CANCEL "service taken over by another connection"`;
-/// 1. a bad head: `431`, `400`, or past the deadline `RESET CANCEL`;
+/// 1. a bad head: `431`, `400`, or past the deadline `RESET CANCEL`; then a
+///    per-request [`state_for_request`](ServeContext::state_for_request) in
+///    conflict: `RESET CANCEL`, as row 0, on any path;
 /// 2. a path other than [`MCP_PATH`]: `404`;
 /// 3. not [`RegistrationState::Registered`]: `503`;
 /// 4. a body over the cap: `413`;
@@ -229,10 +306,7 @@ impl<T> Drop for AbortOnDrop<T> {
 
 async fn serve(stream: Stream, ctx: ServeContext, responder: handler::Responder) {
     if (ctx.state)().conflict {
-        stream.reset(
-            ErrorCode::CANCEL,
-            "service taken over by another connection",
-        );
+        stream.reset(ErrorCode::CANCEL, crate::session::TAKEN_OVER_MESSAGE);
         return;
     }
     let mut reader = Reader::new(stream);
@@ -257,11 +331,25 @@ async fn serve(stream: Stream, ctx: ServeContext, responder: handler::Responder)
         Ok(h) => h,
         Err(e) => return refuse(reader.into_inner(), e.status, &e.message, false).await,
     };
+    let request_state = ctx.request_state.as_ref().map(|f| {
+        f(&RequestInfo {
+            host: &head.host,
+            method: &head.method,
+            target: &head.target,
+        })
+    });
+    if request_state.is_some_and(|s| s.conflict) {
+        reader
+            .get_ref()
+            .reset(ErrorCode::CANCEL, crate::session::TAKEN_OVER_MESSAGE);
+        return;
+    }
     let head_request = head.method == "HEAD";
     if http1::request_path(&head.target) != MCP_PATH {
         return refuse(reader.into_inner(), 404, "not_found", head_request).await;
     }
-    let unavailable = match (ctx.state)().registration {
+    let state = request_state.unwrap_or_else(|| (ctx.state)());
+    let unavailable = match state.registration {
         RegistrationState::Registered => None,
         RegistrationState::Disabled => Some("service disabled"),
         RegistrationState::Closing => Some("service closing"),

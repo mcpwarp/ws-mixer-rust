@@ -32,7 +32,7 @@
 //! | `Error(Transport{reason})` | a fatal disconnect; the exposure then closes with this error | (`Close{error}`) |
 //! | `Error(Handler)` | a handler error/panic, a response body failure, an `on_retry` panic | `HandlerError` |
 //! | `Error(Fatal{error})` | the session failed (a refusal before the first registration, `UNSUPPORTED_VERSION`): observed when the driver starts closing the client, after `State(Closing)` and before the close runs; `Close{error}` carries the same error later | (`Close{error}`) |
-//! | `Disconnect{reason, superseded}` | every transport disconnect; `superseded` = the session ignored it (a drained connection whose replacement welcomed, or a replacement's failed dial while the drained one serves) | `Disconnect` |
+//! | `Disconnect{reason, superseded}` | every transport disconnect; `superseded` = the session ignored it (a drained connection whose replacement welcomed, a replacement's failed dial while the drained one serves, or a connection the session never saw welcomed while another is live) | `Disconnect` |
 //! | `Retry{info, kind}` | every scheduled retry: `Failure`/`TokenRefresh`/`Drain` redials, `Register` (transient) and `Overloaded` re-sends; fires whether or not `on_retry` is set; never for an abandoned `drain{replaced}` dial | (`on_retry`) |
 //! | `Close{error}` | once, last; `error` is the fatal error (register refusal, `UNSUPPORTED_VERSION`, `UNAUTHORIZED`, `DISCONNECTED_FATAL`, `TAKEN_OVER`) or `None` after `close()` / an abort | `Close` |
 //!
@@ -77,7 +77,10 @@ pub(crate) enum ExposeObservation {
     /// A transport disconnect.
     Disconnect {
         reason: DisconnectReason,
-        /// The session ignored it: see the module docs.
+        /// The session ignored it: a drained connection whose replacement
+        /// welcomed, a replacement's failed dial while the drained one
+        /// serves, or a connection the session never saw welcomed while
+        /// another is live.
         superseded: bool,
     },
     /// A retry was scheduled.

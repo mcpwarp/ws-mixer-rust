@@ -37,9 +37,9 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-/// Fixtures the runner must have run for the pinned spec (v0.6.1: 01-32,
-/// 34, 35).
-const MIN_RUN: usize = 34;
+/// A floor on the fixtures run for the pinned spec (v0.6.2 has 36: 01-32,
+/// 34-37, all run, 07 without its unrepresentable config).
+const MIN_RUN: usize = 36;
 
 #[cfg(not(feature = "test-util"))]
 #[test]

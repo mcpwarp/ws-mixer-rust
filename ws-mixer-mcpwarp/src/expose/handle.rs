@@ -193,8 +193,8 @@ impl ExposeHandle {
         self.inner.shared.snapshot().url
     }
 
-    /// The latest server id, from `registered`, `disable`, `enable` or a
-    /// `SERVER_DISABLED` refusal.
+    /// The latest server id, from `registered`, `enable` or a
+    /// `SERVER_DISABLED` refusal. A `disable` never introduces one.
     pub fn server_id(&self) -> Option<String> {
         self.inner.shared.snapshot().server_id
     }

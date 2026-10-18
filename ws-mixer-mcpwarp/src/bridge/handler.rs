@@ -63,7 +63,7 @@ pub(crate) mod sealed {
 /// Implemented for every [`tower_service::Service`] that takes an
 /// [`http::Request<RequestBody>`] and returns an [`http::Response`] with a
 /// [`Bytes`] body (cloned once per request, as tower services are), and for
-/// [`Target`](super::Target) (`target` feature). Build one from a closure
+/// `Target` (`target` feature). Build one from a closure
 /// with [`handler_fn`]. Sealed: it cannot be implemented outside this crate.
 ///
 /// The request a handler gets (MCPWARP.md §4.6): URI

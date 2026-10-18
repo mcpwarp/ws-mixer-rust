@@ -155,6 +155,125 @@ async fn refusal_is_written_before_the_body_and_drained() {
     assert_eq!(peer.recv().await, None, "no RESET after the drain");
 }
 
+/// Registered, except `b.example` (disabled) and `c.example` (taken over).
+fn per_host() -> ServeContext {
+    online().state_for_request(|req| match req.host() {
+        "b.example" => RegistrationState::Disabled.into(),
+        "c.example" => ServeState::new(RegistrationState::Registered).conflict(true),
+        _ => RegistrationState::Registered.into(),
+    })
+}
+
+#[tokio::test]
+async fn per_request_503_beats_413_before_the_body() {
+    let (s, mut peer) = Stream::new_in_memory(1);
+    let task = tokio::spawn(serve_stream(s, &per_host(), &echo()));
+    peer.write(b"POST /mcp HTTP/1.1\r\nHost: b.example\r\nContent-Length: 5000000\r\n\r\n")
+        .unwrap();
+    let want = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 28\r\n\r\n{\"error\":\"service disabled\"}";
+    let mut got = Vec::new();
+    while got.len() < want.len() {
+        match peer.recv().await {
+            Some(PeerEvent::Data(d)) => got.extend_from_slice(&d),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(got, want.as_bytes());
+    assert_eq!(peer.recv().await, Some(PeerEvent::Close));
+    assert!(!task.is_finished(), "draining, the body never read");
+    peer.write(&[b'x'; 1024]).unwrap();
+    peer.close();
+    task.await.unwrap();
+    assert_eq!(peer.recv().await, None, "no RESET after the drain");
+
+    // The same request for a registered host reaches the cap.
+    let input = "POST /mcp HTTP/1.1\r\nHost: a.example\r\nContent-Length: 5000000\r\n\r\n";
+    let (out, end) = exchange(&per_host(), &echo(), input.as_bytes()).await;
+    assert!(
+        out.starts_with("HTTP/1.1 413 Content Too Large\r\n"),
+        "{out}"
+    );
+    assert_eq!(end, Some(PeerEvent::Close));
+}
+
+#[tokio::test]
+async fn per_request_conflict_resets_after_the_head() {
+    let (s, mut peer) = Stream::new_in_memory(1);
+    let task = tokio::spawn(serve_stream(s, &per_host(), &echo()));
+    peer.write(b"POST /mcp HTTP/1.1\r\nHost: c.example\r\nContent-Length: 10\r\n\r\nabc")
+        .unwrap();
+    task.await.unwrap();
+    assert_eq!(
+        peer.recv().await,
+        Some(PeerEvent::Reset {
+            code: ErrorCode::CANCEL,
+            message: "service taken over by another connection".into()
+        })
+    );
+    let input = "POST /mcp HTTP/1.1\r\nHost: a.example\r\nContent-Length: 2\r\n\r\n{}";
+    let (out, end) = exchange(&per_host(), &echo(), input.as_bytes()).await;
+    assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
+    assert_eq!(end, Some(PeerEvent::Close));
+}
+
+#[tokio::test]
+async fn per_request_state_sees_the_head() {
+    let seen = Arc::new(Mutex::new(Vec::<(String, String, String)>::new()));
+    let sink = seen.clone();
+    let ctx = online().state_for_request(move |req| {
+        sink.lock().unwrap().push((
+            req.host().to_owned(),
+            req.method().to_owned(),
+            req.target().to_owned(),
+        ));
+        RegistrationState::Registered.into()
+    });
+    for input in [
+        "GET /mcp?x=1 HTTP/1.1\r\nHost: a.example\r\n\r\n",
+        "POST https://other.example/mcp?q=caf\u{e9}#f HTTP/1.1\r\nhost: b.example:8443\r\nContent-Length: 0\r\n\r\n",
+        "GET /healthz HTTP/1.1\r\nHost: a.example\r\n\r\n",
+    ] {
+        exchange(&ctx, &echo(), input.as_bytes()).await;
+    }
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            ("a.example".into(), "GET".into(), "/mcp?x=1".into()),
+            (
+                "b.example:8443".into(),
+                "POST".into(),
+                "/mcp?q=caf\u{c3}\u{a9}".into()
+            ),
+            ("a.example".into(), "GET".into(), "/healthz".into()),
+        ],
+        "called for a 404 too"
+    );
+
+    // Row 0 beats the 404: a host in conflict is reset on any path.
+    let (s, mut peer) = Stream::new_in_memory(1);
+    let task = tokio::spawn(serve_stream(s, &per_host(), &echo()));
+    peer.write(b"GET /other HTTP/1.1\r\nHost: c.example\r\n\r\n")
+        .unwrap();
+    task.await.unwrap();
+    assert_eq!(
+        peer.recv().await,
+        Some(PeerEvent::Reset {
+            code: ErrorCode::CANCEL,
+            message: "service taken over by another connection".into()
+        })
+    );
+
+    // Row 0 still reads the state given to new(), before the head.
+    let ctx = ServeContext::new(|| ServeState::new(RegistrationState::Registered).conflict(true))
+        .state_for_request(|_| RegistrationState::Registered.into());
+    let (s, mut peer) = Stream::new_in_memory(1);
+    serve_stream(s, &ctx, &echo()).await;
+    assert!(matches!(
+        peer.recv().await,
+        Some(PeerEvent::Reset { code, .. }) if code == ErrorCode::CANCEL
+    ));
+}
+
 #[tokio::test]
 async fn body_over_cap_is_413_without_the_handler() {
     let called = Arc::new(Mutex::new(false));

@@ -488,7 +488,7 @@ fn drain_replaced_takes_over_like_conflict_and_a_second_changes_nothing() {
 }
 
 #[test]
-fn disable_matching_id_or_before_any_id_and_enable_reregisters() {
+fn disable_matching_id_and_enable_reregisters() {
     let mut h = H::new();
     h.welcome(1);
     h.registered(false);
@@ -506,16 +506,131 @@ fn disable_matching_id_or_before_any_id_and_enable_reregisters() {
     assert_eq!(h.ops(), ["register", "register"]);
     h.registered(false);
     assert_eq!(h.s.state(), ExposeState::Registered);
+}
 
-    let mut fresh = H::new();
-    fresh.welcome(1);
-    fresh.app(json!({"op": "disable", "id": "srv_x"}));
-    assert_eq!(fresh.s.state(), ExposeState::Disabled);
-    assert_eq!(fresh.s.server_id(), Some("srv_x"));
+// --- disable before any server id is known (v0.6.3) ------------------------------
+
+#[test]
+fn a_disable_before_any_server_id_is_held_and_applied_by_a_matching_registered() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "disable", "id": "srv_anki", "reason": "maintenance"}));
+    assert_eq!(h.s.state(), ExposeState::Registering);
+    assert_eq!(h.s.server_id(), None);
+    assert!(h.disabled().is_empty());
+    h.registered(true);
+    assert_eq!(h.s.state(), ExposeState::Disabled);
+    assert_eq!(h.s.server_id(), Some("srv_anki"));
+    assert_eq!(h.registrations().len(), 1);
     assert_eq!(
-        fresh.disabled(),
-        [(Some("srv_x".into()), "disabled".into())]
+        h.disabled(),
+        [(Some("srv_anki".into()), "maintenance".into())]
     );
+    // As a `disable` right after `registered` would.
+    assert_eq!(h.states(), ["registering", "registered", "disabled"]);
+    assert!(h.closed.is_empty());
+}
+
+#[test]
+fn a_held_disable_for_another_id_is_dropped_by_registered() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "disable", "id": "srv_other"}));
+    h.registered(true);
+    assert_eq!(h.s.state(), ExposeState::Registered);
+    assert!(h.disabled().is_empty());
+    // Dropped, not kept for a later `registered` that names its id.
+    h.app(json!({"op": "registered", "services": [
+        {"name": "anki", "id": "srv_other", "url": "https://anki-u.x/mcp"}
+    ]}));
+    assert_eq!(h.s.server_id(), Some("srv_other"));
+    assert_eq!(h.s.state(), ExposeState::Registered);
+    assert!(h.disabled().is_empty());
+}
+
+#[test]
+fn only_the_latest_held_disable_counts() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "disable", "id": "srv_anki", "reason": "first"}));
+    h.app(json!({"op": "disable", "id": "srv_other", "reason": "second"}));
+    h.registered(true);
+    assert_eq!(h.s.state(), ExposeState::Registered);
+    assert!(h.disabled().is_empty());
+
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "disable", "id": "srv_other", "reason": "first"}));
+    h.app(json!({"op": "disable", "id": "srv_anki", "reason": "second"}));
+    h.registered(true);
+    assert_eq!(h.disabled(), [(Some("srv_anki".into()), "second".into())]);
+}
+
+#[test]
+fn a_disconnect_drops_a_held_disable() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "disable", "id": "srv_anki"}));
+    assert!(!h.disconnect(1));
+    h.welcome(2);
+    h.registered(true);
+    assert_eq!(h.s.state(), ExposeState::Registered);
+    assert!(h.disabled().is_empty());
+}
+
+#[test]
+fn a_matching_enable_drops_a_held_disable() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "disable", "id": "srv_anki"}));
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    assert_eq!(h.s.state(), ExposeState::Registering);
+    assert_eq!(h.ops(), ["register", "register"]);
+    h.registered(false);
+    assert_eq!(h.s.state(), ExposeState::Registered);
+    assert!(h.disabled().is_empty());
+}
+
+#[test]
+fn server_disabled_drops_a_held_disable_with_one_disabled_event() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "disable", "id": "srv_anki", "reason": "maintenance"}));
+    h.reg_error("SERVER_DISABLED", json!({"id": "srv_anki"}));
+    assert_eq!(h.s.state(), ExposeState::Disabled);
+    assert_eq!(h.disabled(), [(Some("srv_anki".into()), "disabled".into())]);
+    // Accepted while disabled; the dropped hold is not applied by it.
+    h.registered(false);
+    assert_eq!(h.s.state(), ExposeState::Registered);
+    assert_eq!(h.disabled().len(), 1);
+}
+
+#[test]
+fn a_held_disable_survives_a_drain_hand_over() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "disable", "id": "srv_anki", "reason": "maintenance"}));
+    assert!(!h.drain(1, DrainReason::Rollout));
+    h.welcome(2);
+    h.registered(true);
+    assert_eq!(h.s.state(), ExposeState::Disabled);
+    assert_eq!(
+        h.disabled(),
+        [(Some("srv_anki".into()), "maintenance".into())]
+    );
+}
+
+#[test]
+fn a_held_disable_is_dropped_when_the_drained_connection_ends_before_the_welcome() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "disable", "id": "srv_anki"}));
+    assert!(!h.drain(1, DrainReason::Rollout));
+    assert!(!h.disconnect(1));
+    h.welcome(2);
+    h.registered(true);
+    assert_eq!(h.s.state(), ExposeState::Registered);
+    assert!(h.disabled().is_empty());
 }
 
 #[test]
@@ -872,7 +987,8 @@ fn registered_is_accepted_while_disabled_and_resets_backoff() {
     h.welcome(1);
     h.reg_error("INTERNAL", json!({}));
     h.reg_error("INTERNAL", json!({}));
-    h.app(json!({"op": "disable", "id": "srv_anki"}));
+    h.reg_error("SERVER_DISABLED", json!({"id": "srv_anki"}));
+    assert_eq!(h.s.state(), ExposeState::Disabled);
     h.registered(true);
     assert_eq!(h.s.state(), ExposeState::Registered);
     h.reg_error("INTERNAL", json!({}));
@@ -981,6 +1097,46 @@ fn t30_the_live_connection_ending_is_a_lost_connection() {
     // A failed dial afterwards changes nothing further.
     assert!(!h.disconnect(2));
     assert_eq!(h.s.state(), ExposeState::Connecting);
+}
+
+#[test]
+fn an_unknown_connection_ending_while_another_is_live_changes_nothing() {
+    // A shared client: conn 1 drained and ended before this session existed
+    // to see it; the session was welcomed on conn 2.
+    let mut h = H::new();
+    h.welcome(2);
+    h.registered(true);
+    assert!(h.disconnect(1));
+    assert_eq!(h.s.state(), ExposeState::Registered);
+    assert!(h.s.connected);
+    assert_eq!(h.states(), ["registering", "registered"]);
+    // Still connected: close unregisters.
+    h.close();
+    assert_eq!(h.ops(), ["register", "unregister"]);
+}
+
+#[test]
+fn an_unknown_connection_ending_keeps_a_pending_register_retry() {
+    let mut h = H::new();
+    h.welcome(2);
+    h.reg_error("INTERNAL", json!({}));
+    assert_eq!(h.timers.len(), 1);
+    assert!(h.disconnect(1));
+    assert_eq!(h.timers.len(), 1);
+    assert_eq!(h.s.state(), ExposeState::Registering);
+    h.advance(MS * 1000);
+    assert_eq!(h.ops(), ["register", "register"]);
+}
+
+#[test]
+fn the_live_connection_ending_after_an_ignored_unknown_one_is_a_lost_connection() {
+    let mut h = H::new();
+    h.welcome(2);
+    h.registered(true);
+    assert!(h.disconnect(1));
+    assert!(!h.disconnect(2));
+    assert_eq!(h.s.state(), ExposeState::Connecting);
+    assert!(!h.s.connected);
 }
 
 #[test]

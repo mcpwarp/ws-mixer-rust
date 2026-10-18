@@ -120,10 +120,10 @@ jobs:
             [ "$2" -ge "$3" ] || fail "$1: $2 below floor $3"
             echo "$1: $2 (floor $3)"
           }
-          check tunnel "$(count 'tunnel ([0-9]+)/[0-9]+')" 34
+          check tunnel "$(count 'tunnel ([0-9]+)/[0-9]+')" 36
           check bridging "$(count 'bridging ([0-9]+)/[0-9]+')" 13
-          check envelope "$(count 'envelope ([0-9]+) \(')" 60
-          check envelope-asserted "$(count 'envelope [0-9]+ \(([0-9]+) asserted')" 46
+          check envelope "$(count 'envelope ([0-9]+) \(')" 63
+          check envelope-asserted "$(count 'envelope [0-9]+ \(([0-9]+) asserted')" 49
           check status-text-entries "$(count 'status-text table entries: ([0-9]+)')" 102
           check status-text-cases "$(count 'status-text cases: ([0-9]+)')" 26
           grep -qF 'status-text rules: checked' "$log" || fail "status-text rules did not run"

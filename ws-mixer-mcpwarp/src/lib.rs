@@ -5,7 +5,7 @@
 //! service with a `register` envelope after every `welcome`, and answers each
 //! stream the edge opens as one HTTP/1.1 request to `/mcp`.
 //!
-//! This release ships the Tier 1 building blocks of spec v0.6.1:
+//! This release ships the Tier 1 building blocks of spec v0.6.2:
 //!
 //! - the envelope: [`encode_register`] / [`encode_unregister`] (byte-exact,
 //!   §2.2) and [`decode_envelope`] (§2.8), with [`RegisterErrorCode`],
@@ -16,7 +16,10 @@
 //!   `X-Mcpwarp-Integration`, `User-Agent`, §3.1);
 //! - the sans-IO registration state machine ([`session::Session`]: §2.7,
 //!   §3.2, §3.3);
-//! - request bridging ([`bridge::serve_stream`]: §4);
+//! - request bridging ([`bridge::serve_stream`]: §4), with per-request
+//!   state ([`bridge::ServeContext::state_for_request`]) for hosts serving
+//!   several services, and with the `target` feature
+//!   `bridge::target_reply` to tell a `Target`'s own `502`/`504` apart;
 //! - [`expose()`]: one client, one registered service, every request served
 //!   (§5), with [`ExposeHandle`] and [`ExposeEvent`];
 //! - the tunnel controller ([`Tunnel`], §6): configure at runtime, one
@@ -24,7 +27,7 @@
 //! - status text ([`describe_status`], §7).
 //!
 //! [ws-mixer]: https://docs.rs/ws-mixer
-//! [MCPWARP.md]: https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.1/docs/MCPWARP.md
+//! [MCPWARP.md]: https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.2/docs/MCPWARP.md
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

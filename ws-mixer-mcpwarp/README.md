@@ -2,8 +2,8 @@
 
 The mcpwarp layer over [ws-mixer](https://github.com/mcpwarp/ws-mixer-rust): expose a local MCP
 server at a public mcpwarp URL. Implements §2-§8 of
-[`docs/MCPWARP.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.1/docs/MCPWARP.md) in
-ws-mixer-spec **v0.6.1**, on ws-mixer 0.2.
+[`docs/MCPWARP.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.2/docs/MCPWARP.md) in
+ws-mixer-spec **v0.6.2**, on ws-mixer 0.2.
 
 An agent dials the edge with a `ws_mixer::Client`, sends a `register` envelope for its service
 after every `welcome`, and answers each stream the edge opens as one HTTP/1.1 request to `/mcp`.
@@ -20,7 +20,7 @@ Native only (tokio). The registration machine is a port of
 
 ## Status
 
-0.1.0, not yet released. Every spec fixture set for the agent side passes (see
+0.1.1, not yet released. Every spec fixture set for the agent side passes (see
 [Conformance](#conformance)).
 
 Not on crates.io yet. Depend on a checkout next to your project (the form mcpwarp-desktop uses),
@@ -217,8 +217,8 @@ lifecycle), the building blocks are public on their own:
 | `RegisterErrorCode`, `AppErrorCode`, `TRANSIENT_REGISTER_ERRORS`, `McpwarpError`, `ConfigError` | §2.6, §5.2-§5.4 | Error codes with `as_str()` / wire parsing and `is_transient()`; config errors carry §5.2's messages and never echo the value. |
 | `is_valid_service_name`, `is_valid_integration_id`, `SERVICE_NAME_RE`, `ServiceKind` | §2.4 | Name and integration-id syntax, without a regex crate. |
 | `Identity`, `Agent` | §3.1, §8 | `hello.meta` (`client: "sdk-rust"`), `hello.agent.runtime`/`os`, the `X-Mcpwarp-Integration` and `User-Agent` headers. `Identity::apply` sets them on a `ws_mixer::ClientBuilder` and vetoes the replacement dial for `drain{replaced}`. |
-| `session::Session` | §2.7, §3.2, §3.3, §5.9 | The sans-IO registration machine for one service: feed it `welcome`, `app`, `drain`, `disconnected`, timer firings; run the `Command`s it queues. It ignores envelopes for other names. |
-| `bridge::serve_stream`, `ServeContext`, `Handler`, `handler_fn`, `Target` | §4 | One stream as one HTTP/1.1 request: head limits (64 KiB, 10 s), the `/mcp` rule, `503` while unavailable, the body cap (`413`), byte-exact error replies, response framing. |
+| `session::Session` | §2.7, §3.2, §3.3, §5.9 | The sans-IO registration machine for one service: feed it `welcome`, `app`, `drain`, `disconnected`, timer firings; run the `Command`s it queues. It ignores envelopes for other names, and holds a `disable` for an unknown id until `registered` names it. |
+| `bridge::serve_stream`, `ServeContext`, `RequestInfo`, `Handler`, `handler_fn`, `Target`, `target_reply` | §4 | One stream as one HTTP/1.1 request: head limits (64 KiB, 10 s), the `/mcp` rule, `503` while unavailable (per connection, or per request with `state_for_request`), the body cap (`413`), byte-exact error replies, response framing. |
 | `describe_status`, `describe_status_raw`, `DescribeOptions`, `STATUS_LOCALES` | §7 | Status as UI text in `en`, `de`, `es`, `fr`, `ja`, `zh-CN`; locale fallback by language, then `en`; per-call overrides. `_raw` takes wire strings, for codes this version does not know. |
 
 ### Bridging and `Handler`
@@ -264,6 +264,9 @@ A `Target` never fails for a slow or missing server: no response headers within 
 `504 {"error":"local server timed out"}`, an unreachable server is
 `502 {"error":"local server unreachable (<code>)"}`. Returned unedited, those are written as the
 SDK's byte-exact replies; edited by middleware, they are written as ordinary app responses.
+`target_reply(&res)` tells them from the local server's own responses:
+`Some(TargetReply::Unreachable { code, .. })` or `Some(TargetReply::Timeout)`, also after in-place
+edits (a header added, the status changed), `None` once a layer rebuilds the response.
 
 To serve streams from your own client, spawn `serve_stream` per `Event::Stream` (never await it
 inline) with a `ServeContext` that reports your registration state:
@@ -286,6 +289,59 @@ async fn serve(mut events: ws_mixer::Events) {
 }
 ```
 
+### Several services on one client
+
+One `session::Session` per service, all fed the same transport events. A `Session` created while
+a connection is already live must be given `on_welcome(<live conn>)` by you; it is not
+retroactive. A connection that ended before the session existed is ignored by its
+`on_disconnected`.
+
+A `conflict` is per service; a `drain{replaced}` is per connection. Tell them apart by the
+`SessionEvent::Conflict` reason (or by `on_drain` returning `true`):
+
+- `"replaced"`: the edge replaced the whole connection. Every session on it enters conflict;
+  close the client at once with `Client::close_immediate` and never redial (`Identity::apply`
+  already vetoes the replacement dial).
+- any other reason (`"taken_over"`): one service lost its name to another install. Keep the
+  connection and the other services, ignore that session's `Command::CloseImmediate`, send no
+  `unregister` for it (the session already clears that), and never `register` that name again
+  until the user reconfigures it.
+
+Streams for that service's `Host` may still arrive until the edge's new holder settles. Per §3.3
+they must be reset with `CANCEL` "service taken over by another connection", not answered. The
+same goes for a paused service: its `503` should come per `Host`, not for the whole connection.
+`ServeContext::state_for_request` gives the state per request, after the head and before any body
+byte: return `ServeState::new(..).conflict(true)` for a taken-over `Host` and `serve_stream`
+resets the stream; return `Disabled`, `Closing` or `Unavailable` and it answers `503` before the
+body is read (§4.4 row 3):
+
+```rust
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+use ws_mixer_mcpwarp::bridge::{RegistrationState, ServeContext, ServeState};
+
+/// Each public host's state, keyed by `host_key`, kept current by the event loop from its session.
+type States = Arc<RwLock<HashMap<String, ServeState>>>;
+
+/// `Host` is received with case and port kept: lowercase it and drop any `:port`.
+fn host_key(host: &str) -> String {
+    host.rsplit_once(':').map_or(host, |(name, _port)| name).to_ascii_lowercase()
+}
+
+fn context(states: States) -> ServeContext {
+    ServeContext::new(|| RegistrationState::Registered.into()).state_for_request(move |req| {
+        let states = states.read().unwrap_or_else(|e| e.into_inner());
+        states.get(&host_key(req.host())).copied().unwrap_or(RegistrationState::Unavailable.into())
+    })
+}
+```
+
+A child server that is restarting is the same case: return `Unavailable` for its `Host`
+(`503 {"error":"service unavailable"}`, body unread) and leave the others `Registered`. Answer
+from the handler instead only when you need a `Retry-After` header; `target_reply` tells you when
+a `Target` found the child down.
+
 ## Cargo features
 
 | Feature | Default | Effect |
@@ -302,22 +358,28 @@ The TLS features forward to ws-mixer's features of the same name; see its README
 providers coexist. With `default-features = false`, pick a TLS stack: `native-tls`, or a rustls
 feature together with `ring` or `aws-lc-rs`. A build without one fails with `compile_error!`.
 
+The crate enables `serde_json/preserve_order`, so `register` / `unregister` keep the spec's key
+order byte for byte (ws-mixer's `send_app` takes a `serde_json::Value`). Cargo features are
+unified, so every `serde_json::Map` in your build then keeps insertion order instead of sorting
+keys. To see whether your graph already has it:
+`cargo tree -e features -i serde_json | grep preserve_order`.
+
 MSRV: Rust 1.85 (edition 2024).
 
 ## Conformance
 
-The spec's agent-side fixtures (`spec/fixtures/mcpwarp`, MCPWARP.md §10) at v0.6.1:
+The spec's agent-side fixtures (`spec/fixtures/mcpwarp`, MCPWARP.md §10) at v0.6.2:
 
 | Set | Result |
 |---|---|
-| envelope | 60: 46 asserted (3 encoder byte checks, 43 decodes); 14 agent -> edge invalid cases are edge-runner only and noted |
+| envelope | 63: 49 asserted (3 encoder byte checks, 46 decodes); 14 agent -> edge invalid cases are edge-runner only and noted |
 | bridging | 13 of 14 run and pass; `body_413_streamed_reset` applies only to adapters that stream the request body (this SDK buffers it; `body_413` covers the cap) |
-| tunnel | 34/34, on the fake edge with a paused clock |
+| tunnel | 36/36, on the fake edge with a paused clock |
 | status text | 102 table entries, 26 cases, and the rules file |
 
 Run them with `make mcpwarp-fixtures` from the repository root (it fetches the spec at `spec.pin`
-and enables `test-util`, which the tunnel runner needs). Fixtures from the upcoming spec v0.6.2
-and v0.6.3 (not tagged yet) are picked up when `spec.pin` moves.
+and enables `test-util`, which the tunnel runner needs). Fixtures from the upcoming spec v0.6.3
+(not tagged yet) are picked up when `spec.pin` moves.
 
 ## Deviations and choices
 
@@ -338,8 +400,15 @@ and v0.6.3 (not tagged yet) are picked up when `spec.pin` moves.
 - **The request target is percent-encoded** before it reaches the handler or target, per the
   §4.3 rule of the upcoming spec v0.6.3: the fragment is dropped and every byte outside RFC
   3986's allowed set (non-ASCII, controls, space, `"` `<` `>` `\` `^` `` ` `` `{` `|` `}`) is
-  escaped as `%XX`; `%` itself is kept as written. The v0.6.1 text says the origin-form target is
+  escaped as `%XX`; `%` itself is kept as written. The v0.6.2 text says the origin-form target is
   forwarded as is.
+- **A `disable` for an unknown id is held, not adopted**, per the upcoming spec v0.6.3: the edge
+  sends `disable` to every connection of the owner, so before this service's `registered` the id
+  may be another service's. While no server id is known, the latest such `disable` is kept and
+  applied only if the next successful `registered` carries that id (a transient
+  `registered{errors}` keeps the hold); a disconnect, close, take-over, matching
+  `enable` or `SERVER_DISABLED` drops it. The server id therefore never comes from `disable`.
+  The v0.6.2 text adopts the id when none is known.
 - **A handler status below 200 or from 600 up** is answered `500 {"error":"handler error"}` and
   reported, like a handler error.
 - **The 64 KiB head cap counts the blank line** that ends the head (`\r\n\r\n`); a head of

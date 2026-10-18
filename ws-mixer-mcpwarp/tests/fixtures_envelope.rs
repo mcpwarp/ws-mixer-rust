@@ -18,9 +18,9 @@ use ws_mixer_mcpwarp::{
     encode_unregister, is_valid_service_name,
 };
 
-/// Floors for the pinned spec (v0.6.1): raise them as the corpus grows.
+/// Floors for the pinned spec (v0.6.2): raise them as the corpus grows.
 const MIN_ENCODED: usize = 3;
-const MIN_DECODED: usize = 43;
+const MIN_DECODED: usize = 46;
 
 #[test]
 fn envelope_fixtures() {

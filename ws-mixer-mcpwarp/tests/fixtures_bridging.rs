@@ -33,7 +33,7 @@ use ws_mixer_mcpwarp::bridge::{
     RegistrationState, RequestBody, ServeContext, ServeState, handler_fn, serve_stream,
 };
 
-/// Fixtures the runner must have run for the pinned spec (v0.6.1).
+/// Fixtures the runner must have run for the pinned spec (v0.6.2).
 const MIN_RUN: usize = if cfg!(feature = "target") { 13 } else { 12 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

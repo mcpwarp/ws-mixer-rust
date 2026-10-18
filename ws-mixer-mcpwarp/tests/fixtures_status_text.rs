@@ -19,7 +19,7 @@ use ws_mixer_mcpwarp::{
     describe_status, describe_status_raw, last_error,
 };
 
-/// Floors for the pinned spec (v0.6.1): raise them as the corpus grows.
+/// Floors for the pinned spec (v0.6.2): raise them as the corpus grows.
 const MIN_TABLE_ENTRIES: usize = 102;
 const MIN_CASES: usize = 26;
 

@@ -96,6 +96,12 @@ pub(crate) fn error_reply(status: u16, message: &str, head_request: bool) -> Vec
 pub(crate) struct SdkReply {
     pub(crate) status: u16,
     pub(crate) message: String,
+    /// The I/O cause code of a `502`, when known.
+    #[cfg_attr(
+        not(feature = "target"),
+        allow(dead_code, reason = "read only by target_reply")
+    )]
+    pub(crate) code: Option<&'static str>,
     /// Length of the JSON body.
     body_len: u64,
 }
@@ -106,7 +112,11 @@ pub(crate) struct SdkReply {
     not(feature = "target"),
     allow(dead_code, reason = "only a Target produces SDK replies as responses")
 )]
-pub(crate) fn sdk_reply_response(status: u16, message: &str) -> Response<ResponseBody> {
+pub(crate) fn sdk_reply_response(
+    status: u16,
+    message: &str,
+    code: Option<&'static str>,
+) -> Response<ResponseBody> {
     let body = serde_json::json!({ "error": message }).to_string();
     let body_len = body.len() as u64;
     let mut res = Response::new(
@@ -122,6 +132,7 @@ pub(crate) fn sdk_reply_response(status: u16, message: &str) -> Response<Respons
     res.extensions_mut().insert(SdkReply {
         status,
         message: message.to_owned(),
+        code,
         body_len,
     });
     res
