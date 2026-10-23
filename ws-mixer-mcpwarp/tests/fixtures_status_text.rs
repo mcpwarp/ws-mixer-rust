@@ -3,10 +3,14 @@
 //!
 //! - every `<locale>.json` has exactly the 17 legal `<state>.<code|none>`
 //!   keys, and each entry equals `describe_status({state, code})`;
+//! - the seven multi-service keys of §6A.9: each `service.<state>` equals
+//!   `describe_service_status_raw(state)`, `lastError.NO_SERVICE_REGISTERED` the
+//!   group's `error`/`INTERNAL` status;
 //! - the strings derived from each table (a state's label, a code's
 //!   sentence) equal the embedded ones, so the shipped tables cannot drift;
 //! - `rules.json` constants match what the implementation hard-codes;
-//! - every `cases.json` case gives exactly `expect`.
+//! - every `cases.json` case gives exactly `expect`, `input.service` cases
+//!   through `describe_service_status_raw`.
 
 mod common;
 
@@ -16,12 +20,30 @@ use std::path::Path;
 use serde_json::{Value, json};
 use ws_mixer_mcpwarp::{
     DescribeOptions, STATUS_LOCALES, StatusText, TunnelState, TunnelStatus, TunnelStatusCode,
-    describe_status, describe_status_raw, last_error,
+    describe_service_status_raw, describe_status, describe_status_raw, last_error,
 };
 
-/// Floors for the pinned spec (v0.6.2): raise them as the corpus grows.
-const MIN_TABLE_ENTRIES: usize = 102;
-const MIN_CASES: usize = 26;
+/// Floors for the pinned spec (v0.7.2): raise them as the corpus grows.
+const MIN_TABLE_ENTRIES: usize = 144;
+const MIN_CASES: usize = 37;
+
+/// A service group's `lastError` when nothing registered (§6A.9).
+const NO_SERVICE_REGISTERED: &str = "No service could be registered.";
+
+/// MCPWARP.md §6A.9: the seven multi-service keys of every table.
+const MULTI_SERVICE_KEYS: &[&str] = &[
+    "lastError.NO_SERVICE_REGISTERED",
+    "service.active",
+    "service.disabled",
+    "service.pending",
+    "service.rejected",
+    "service.taken_over",
+    "service.unregistered",
+];
+
+fn is_multi_service_key(k: &str) -> bool {
+    k.starts_with("service.") || k.starts_with("lastError.")
+}
 
 /// MCPWARP.md §6.5: the 17 legal (state, code) pairs.
 const LEGAL_PAIRS: &[(&str, &[Option<&str>])] = &[
@@ -157,9 +179,11 @@ fn status_text_tables() {
     let en = &tables["en"];
     let mut en_keys: Vec<_> = en.keys().cloned().collect();
     en_keys.sort();
+    let multi: Vec<_> = en_keys.iter().filter(|k| is_multi_service_key(k)).collect();
+    assert_eq!(multi, MULTI_SERVICE_KEYS, "en.json: multi-service keys");
     for k in &en_keys {
         assert!(
-            is_special_key(k) || legal.contains(k),
+            is_special_key(k) || is_multi_service_key(k) || legal.contains(k),
             "en.json: \"{k}\" is not a legal pairing"
         );
     }
@@ -182,6 +206,18 @@ fn status_text_tables() {
         let o = opts(Some(locale));
         for (k, v) in data {
             if is_special_key(k) {
+                continue;
+            }
+            if is_multi_service_key(k) {
+                let got = match k.strip_prefix("service.") {
+                    // `{label}` only: a rejected service's detail needs its code.
+                    Some(state) => {
+                        json!({"label": describe_service_status_raw(state, None, Some(locale)).label})
+                    }
+                    None => describe("error", Some("INTERNAL"), Some(NO_SERVICE_REGISTERED), &o),
+                };
+                assert_eq!(&got, v, "{locale}.json: \"{k}\"");
+                entries += 1;
                 continue;
             }
             let obj = v
@@ -272,9 +308,15 @@ fn status_text_cases() {
         .as_array()
         .expect("cases.json: \"cases\" array");
     assert!(!cases.is_empty());
+    let mut run = 0;
     for (i, c) in cases.iter().enumerate() {
         let desc = c["description"].as_str().expect("description");
-        let status = c["input"]["status"].as_object().expect("input.status");
+        let input = &c["input"];
+        let service = input.get("service");
+        let status = service
+            .unwrap_or(&input["status"])
+            .as_object()
+            .expect("input.status or input.service");
         let locale = match &c["input"]["locale"] {
             Value::Null => None,
             Value::String(s) => Some(s.as_str()),
@@ -287,20 +329,17 @@ fn status_text_cases() {
         };
         let expect = &c["expect"];
         assert!(expect["label"].is_string(), "cases[{i}]: expect.label");
-        let got = describe(
-            field("state").expect("state"),
-            field("code"),
-            field("lastError"),
-            &opts(locale),
-        );
+        let state = field("state").expect("state");
+        // A group status's `services` is ignored (§6A.9).
+        let got = match service {
+            Some(_) => to_json(&describe_service_status_raw(state, field("code"), locale)),
+            None => describe(state, field("code"), field("lastError"), &opts(locale)),
+        };
         assert_eq!(&got, expect, "cases[{i}] {desc}");
+        run += 1;
     }
-    println!("status-text cases: {}", cases.len());
-    assert!(
-        cases.len() >= MIN_CASES,
-        "{} cases, want >= {MIN_CASES}",
-        cases.len()
-    );
+    println!("status-text cases: {run} of {}", cases.len());
+    assert!(run >= MIN_CASES, "{run} cases, want >= {MIN_CASES}");
 }
 
 #[test]
@@ -393,13 +432,20 @@ fn status_text_rules() {
         assert!(tables[locale].contains_key(key), "newInSpec {locale}:{key}");
     }
 
-    // keyFormat.pattern: every table key is "<state>.<none|CODE>".
+    // keyFormat.pattern: every table key is "<state>.<none|CODE>" or one of
+    // the multi-service keys.
     assert_eq!(
         rules["keyFormat"]["pattern"].as_str(),
-        Some("^(off|connecting|online|disabled|conflict|error)\\.(none|[A-Z][A-Z_]*)$")
+        Some(
+            "^((off|connecting|online|disabled|conflict|error)\\.(none|[A-Z][A-Z_]*)|service\\.(pending|active|disabled|rejected|taken_over|unregistered)|lastError\\.NO_SERVICE_REGISTERED)$"
+        )
     );
     for (locale, data) in &tables {
         for k in data.keys().filter(|k| !is_special_key(k)) {
+            if is_multi_service_key(k) {
+                assert!(MULTI_SERVICE_KEYS.contains(&k.as_str()), "{locale}: {k}");
+                continue;
+            }
             let (state, code) = k.split_once('.').unwrap();
             assert!(TunnelState::from_wire(state).is_some(), "{locale}: {k}");
             assert!(

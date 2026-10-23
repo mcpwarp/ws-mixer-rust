@@ -92,6 +92,11 @@ impl<R: AsyncRead + Unpin> Reader<R> {
         &self.inner
     }
 
+    /// The bytes read but not consumed yet.
+    pub(crate) fn buffered(&self) -> &[u8] {
+        &self.buf
+    }
+
     /// The source; bytes buffered but not consumed are dropped.
     pub(crate) fn into_inner(self) -> R {
         self.inner
@@ -288,6 +293,14 @@ pub(crate) fn parse_head(raw: &[u8]) -> Result<RequestHead, HttpError> {
         host,
         framing,
     })
+}
+
+/// Whether the request line at the start of `head` (up to its first CRLF, or
+/// all of it) parses with method `HEAD`: every reply the SDK generates is
+/// then head-only, a head-parse `400` or `431` included (§4.5).
+pub(crate) fn is_head_request_line(head: &[u8]) -> bool {
+    let line = &head[..find(head, b"\r\n").unwrap_or(head.len())];
+    parse_request_line(&latin1(line)).is_ok_and(|(method, _)| method == "HEAD")
 }
 
 /// `^([^ ]+) ([^ ]+) HTTP/1\.([01])$`, method a token.

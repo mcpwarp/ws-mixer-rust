@@ -12,8 +12,8 @@
 //! ([`classify_close`]). Everything the application needs to react to arrives
 //! on the [`Events`] channel.
 //!
-//! This crate implements the client role of spec v0.6.2 and passes the spec
-//! runner's 24 client fixtures and its 10 pair scenarios against the
+//! This crate implements the client role of spec v0.7.2 and passes the spec
+//! runner's 25 client fixtures and its 10 pair scenarios against the
 //! ws-mixer-go v0.9.0 server.
 //!
 //! # Example
@@ -77,11 +77,10 @@
 //!   backlog of unreceived `Stream`/`App`/`Drain` events exceeds
 //!   `max(128, max_streams + 64)` is failed with `ENHANCE_YOUR_CALM`.
 //! - **One [`Event::Disconnected`] per connection attempt.** Every attempt
-//!   that fails or ends reports exactly once. The exceptions: a token rejected
+//!   that fails or ends reports exactly once, including a token rejected
 //!   before `welcome` (HTTP 401, close 4011) that a [`Token::Provider`] gets to
-//!   refresh is retried without a `Disconnected` (an [`Event::Redial`] still
-//!   announces it) and only the retry's outcome is reported, and
-//!   a dial abandoned by [`Client::close`], [`Client::close_with`],
+//!   refresh (non-fatal, then an [`Event::Redial`] and the immediate retry).
+//!   The exception: a dial abandoned by [`Client::close`], [`Client::close_with`],
 //!   [`Client::close_immediate`] or a
 //!   [`ClientBuilder::no_redial_on_drain`] veto reports nothing. Per connection,
 //!   `Connected` comes first and `Disconnected` last, with all of its
@@ -102,7 +101,7 @@
 //!   [`DisconnectReason::retry_in`] is set when a redial is scheduled.
 //! - **Every scheduled dial is announced.** [`Event::Redial`] reports each
 //!   dial the client schedules, with its [`RedialCause`] (a failure, a drain's
-//!   replacement, or the silent token refresh), attempt number and the delay
+//!   replacement, or the token refresh), attempt number and the delay
 //!   actually used. It follows the `Disconnected` or `Drain` it answers.
 //! - **Drain hand-over overlaps connections.** On [`Event::Drain`] the
 //!   client dials a replacement (unless reconnect is disabled or the drain's
@@ -159,7 +158,7 @@
 //! tokio only; [`ClientBuilder::connect`] must be called inside a tokio
 //! runtime. The minimum supported Rust version is 1.85 (edition 2024).
 //!
-//! [ws-mixer.v1]: https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.2/docs/WIRE.md
+//! [ws-mixer.v1]: https://github.com/mcpwarp/ws-mixer-spec/blob/v0.7.2/docs/WIRE.md
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

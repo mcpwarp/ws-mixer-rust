@@ -132,6 +132,38 @@ async fn refusals_end_with_close() {
 }
 
 #[tokio::test]
+async fn head_parse_errors_to_head_are_head_only() {
+    let big = format!(
+        "HEAD /mcp HTTP/1.1\r\nHost: h\r\nx: {}\r\n\r\n",
+        "a".repeat(MAX_HEAD_BYTES)
+    );
+    let cases = [
+        (
+            "HEAD \\mcp HTTP/1.1\r\nHost: h\r\n\r\n".to_owned(),
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 43\r\n\r\n",
+        ),
+        (
+            "HEAD /mcp HTTP/1.1\r\nHost: h\r\n".to_owned(),
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 30\r\n\r\n",
+        ),
+        (
+            big,
+            "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: application/json\r\nContent-Length: 34\r\n\r\n",
+        ),
+        // Not a request line that parsed, so not a HEAD request.
+        (
+            "HEAD  /mcp HTTP/1.1\r\nHost: h\r\n\r\n".to_owned(),
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 34\r\n\r\n{\"error\":\"malformed request line\"}",
+        ),
+    ];
+    for (input, want) in cases {
+        let (out, end) = exchange(&online(), &echo(), input.as_bytes()).await;
+        assert_eq!(out, want, "{:?}", &input[..input.len().min(40)]);
+        assert_eq!(end, Some(PeerEvent::Close));
+    }
+}
+
+#[tokio::test]
 async fn refusal_is_written_before_the_body_and_drained() {
     let ctx = ServeContext::new(|| RegistrationState::Disabled.into());
     let (s, mut peer) = Stream::new_in_memory(1);

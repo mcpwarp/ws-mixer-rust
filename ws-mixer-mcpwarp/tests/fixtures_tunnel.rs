@@ -20,26 +20,66 @@
 //! equals `expect` as JSON values, every one of them legal, the dial count
 //! equals `expectDials`, each `retry` is matched by the last `on_retry` call
 //! since the previous `retry`/`tick` (its reason, delay bound, the drain's
-//! attempt 0, and `OVERLOADED`'s attempt 1, 2, ... back to 1 after
-//! `registered`), and every `configure`/`stop`/`dispose` future has finished.
+//! attempt 0, and `OVERLOADED`'s attempt 1, 2, ... back to 1 after any other
+//! reply: a `registered`, a `register_error`, or an `app_error` other than
+//! `OVERLOADED` and `CONNECTION_LIMIT` answering the frame, i.e. not during
+//! an `OVERLOADED` pause), and every `configure`/`stop`/`dispose` future has
+//! finished.
 //!
 //! `07_invalid_config`'s `kind: "ftp"` is not representable as a
 //! `ServiceKind`: that event and the two snapshots it produces are skipped,
 //! as the fixture allows.
+//!
+//! A fixture with a `token_provider` event passes each token as a provider
+//! (one per token value) that pops the queued results, and the runner's
+//! supervisor calls the client's provider on every dial attempt, as the
+//! transport does: a failed call is a `Disconnected` with no dial, and the
+//! first rejected token before `welcome` is a non-fatal `Disconnected`, then
+//! a `Redial{TokenRefresh}` with delay 0 (CLIENT-SDK.md's Rejected token
+//! row). `disconnect.flush_after` ops go out right after the `Disconnected`
+//! on the same channel, so post-disconnect delivery is supported. Group
+//! fixtures (`ms_*`, `config.services`) are skipped: this SDK has no
+//! multi-service controller. Skips print `skip: tunnel/<file>: <why>`, never
+//! `tunnel: skipped` (conformance.yml fails on that).
 #![cfg_attr(not(feature = "test-util"), allow(dead_code, unused_imports))]
 
 mod common;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-/// A floor on the fixtures run for the pinned spec (v0.6.2 has 36: 01-32,
-/// 34-37, all run, 07 without its unrepresentable config).
-const MIN_RUN: usize = 36;
+/// A floor on the fixtures run for the pinned spec (v0.7.2 has 58: 44
+/// single-service ones, 01-32 and 34-45, all run, 07 without its
+/// unrepresentable config; the 14 `ms_*` group fixtures are skipped).
+const MIN_RUN: usize = 44;
+
+/// The `runnerRequirement`s this runner meets.
+const SUPPORTED_REQUIREMENTS: [&str; 1] = ["post-disconnect-delivery"];
+
+/// The edge messages a `disconnect.flush_after` may carry.
+const FLUSHABLE: [&str; 6] = [
+    "registered",
+    "register_error",
+    "app_error",
+    "disabled",
+    "enabled",
+    "conflict",
+];
+
+/// Why this runner does not run `fx`, if it does not.
+fn skip_reason(fx: &Value) -> Option<String> {
+    if fx["config"].get("services").is_some() {
+        return Some("multi-service profile not implemented (single-service SDK)".into());
+    }
+    match fx.get("runnerRequirement").and_then(Value::as_str) {
+        Some(r) if !SUPPORTED_REQUIREMENTS.contains(&r) => Some(format!("runnerRequirement {r}")),
+        _ => None,
+    }
+}
 
 #[cfg(not(feature = "test-util"))]
 #[test]
@@ -58,9 +98,15 @@ fn tunnel_fixtures() {
     assert!(!vocab.is_empty(), "tunnel/README.md: no Events table");
     let files = common::json_files(&dir);
     let mut failures = Vec::new();
+    let mut skipped = 0;
     for file in &files {
         let name = file.file_name().unwrap().to_string_lossy().into_owned();
         let fx = common::read_json(file);
+        if let Some(why) = skip_reason(&fx) {
+            println!("skip: tunnel/{name}: {why}");
+            skipped += 1;
+            continue;
+        }
         let result = check_fixture(&fx, &vocab).and_then(|()| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -78,8 +124,8 @@ fn tunnel_fixtures() {
             Err(e) => failures.push(format!("tunnel/{name}: {e}")),
         }
     }
-    let passed = files.len() - failures.len();
-    println!("tunnel {passed}/{}", files.len());
+    let passed = files.len() - skipped - failures.len();
+    println!("tunnel {passed}/{} ({skipped} skipped)", files.len());
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     assert!(passed >= MIN_RUN, "only {passed} tunnel fixtures ran");
 }
@@ -332,6 +378,26 @@ fn check_event(
             }
         }
     }
+    if let Some(flush) = p.get("flush_after") {
+        let items = flush
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| format!("{ev}: flush_after is a non-empty array"))?;
+        for item in items {
+            check_event(item, vocab, dials, false)?;
+            let (kind, payload) = item.as_object().unwrap().iter().next().unwrap();
+            if !FLUSHABLE.contains(&kind.as_str()) || payload.get("conn").is_some() {
+                return Err(format!(
+                    "{ev}: flush_after holds edge messages without conn"
+                ));
+            }
+        }
+    }
+    if name == "token_provider"
+        && !["ok", "unavailable", "error"].contains(&p["result"].as_str().unwrap_or_default())
+    {
+        return Err(format!("{ev}: result is ok, unavailable or error"));
+    }
     Ok(())
 }
 
@@ -379,6 +445,13 @@ fn check_fixture(fx: &Value, vocab: &Vocabulary) -> Result<(), String> {
     for ev in events {
         check_event(ev, vocab, dials, false)?;
     }
+    let flushes = events.iter().any(|e| {
+        e.get("disconnect")
+            .is_some_and(|d| d.get("flush_after").is_some())
+    });
+    if flushes && fx["runnerRequirement"] != "post-disconnect-delivery" {
+        return Err("a flush_after needs runnerRequirement post-disconnect-delivery".into());
+    }
     let subscribes = events
         .iter()
         .filter(|e| e.get("subscribe").is_some())
@@ -401,10 +474,11 @@ fn check_fixture(fx: &Value, vocab: &Vocabulary) -> Result<(), String> {
 mod run {
     use super::*;
 
+    use futures_util::FutureExt;
     use tokio::time::Instant;
     use ws_mixer::{
         CloseClass, ConnId, DisconnectReason, DrainNotice, DrainReason, Phase, RedialCause,
-        RedialNotice, classify_close,
+        RedialNotice, Token, TokenError, classify_close,
     };
     use ws_mixer_mcpwarp::bridge::handler_fn;
     use ws_mixer_mcpwarp::test_util::{FakeEdge, settle};
@@ -446,6 +520,11 @@ mod run {
         stable: Option<(usize, Instant)>,
         /// The scheduled dial.
         timer: Option<Instant>,
+        /// The token provider of the config it runs, called per dial.
+        provider: Option<Token>,
+        /// The one refresh after a rejected token was used; re-armed by a
+        /// stable connection.
+        refresh_spent: bool,
     }
 
     impl Client {
@@ -478,6 +557,33 @@ mod run {
         notes: Vec<String>,
         /// The last `OVERLOADED` re-send's attempt; 0 after `registered`.
         overloaded: u32,
+        /// An `OVERLOADED` `app_error` whose `retry` step has not come yet:
+        /// the dropped frame is not on the wire, so an `app_error` answers
+        /// nothing.
+        overload_paused: bool,
+        /// One provider per token value, in a `token_provider` fixture.
+        providers: Option<HashMap<String, Token>>,
+        /// The results of the next provider calls, oldest first.
+        results: Arc<Mutex<VecDeque<String>>>,
+        /// The token of the last `configure` call.
+        last_token: Option<String>,
+        /// The last drain's `retry_after_ms`, a floor for its `retry`.
+        drain_floor: Option<Duration>,
+    }
+
+    /// A provider returning `token`, or failing per the queued result.
+    fn provider(token: String, results: Arc<Mutex<VecDeque<String>>>) -> Token {
+        Token::provider(move || {
+            let next = results.lock().unwrap().pop_front();
+            let token = token.clone();
+            async move {
+                match next.as_deref() {
+                    None | Some("ok") => Ok(token),
+                    Some("unavailable") => Err(TokenError::unavailable("fixture: unavailable")),
+                    Some(_) => Err(TokenError::fatal("fixture: provider error")),
+                }
+            }
+        })
     }
 
     fn conn(d: usize) -> ConnId {
@@ -523,6 +629,16 @@ mod run {
             expect: fx["expect"].as_array().unwrap().clone(),
             notes: Vec::new(),
             overloaded: 0,
+            overload_paused: false,
+            providers: fx["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e.get("token_provider").is_some())
+                .then(HashMap::new),
+            results: Arc::new(Mutex::new(VecDeque::new())),
+            last_token: None,
+            drain_floor: None,
         };
         for (i, ev) in fx["events"].as_array().unwrap().iter().enumerate() {
             r.event(ev)
@@ -576,8 +692,9 @@ mod run {
         }
 
         /// `merged()`: shallow over the base config, `null` = absent.
-        /// `None` for a config this SDK cannot represent.
-        fn merged(&self, over: &Value) -> Option<TunnelConfig> {
+        /// `None` for a config this SDK cannot represent. In a
+        /// `token_provider` fixture a non-blank token becomes its provider.
+        fn merged(&mut self, over: &Value) -> Option<TunnelConfig> {
             let mut out: Map<String, Value> = self.fx["config"].as_object().unwrap().clone();
             for (k, v) in over.as_object().unwrap() {
                 if v.is_null() {
@@ -586,7 +703,19 @@ mod run {
                     out.insert(k.clone(), v.clone());
                 }
             }
-            serde_json::from_value(Value::Object(out)).ok()
+            let mut config: TunnelConfig = serde_json::from_value(Value::Object(out)).ok()?;
+            self.last_token.clone_from(&config.token);
+            if let (Some(providers), Some(token)) = (&mut self.providers, &config.token) {
+                if !token.trim().is_empty() {
+                    let results = self.results.clone();
+                    let p = providers
+                        .entry(token.clone())
+                        .or_insert_with(|| provider(token.clone(), results));
+                    config.token_provider = Some(p.clone());
+                    config.token = None;
+                }
+            }
+            Some(config)
         }
 
         fn call(&mut self, ev: &Value) -> Result<(), String> {
@@ -650,67 +779,14 @@ mod run {
                     let d = self.dial(conn_of(payload))?;
                     self.welcome(d);
                 }
-                "registered" => {
+                "registered" | "register_error" | "app_error" | "disabled" | "enabled"
+                | "conflict" => {
                     let d = self.dial(conn_of(payload))?;
-                    let name = self.name_of(d);
-                    // README: the OVERLOADED attempt is back to 1 after it.
-                    self.overloaded = 0;
-                    let mut services = Vec::new();
-                    for svc in payload["services"].as_array().unwrap() {
-                        if let Some(id) = svc["id"].as_str() {
-                            self.server_ids.insert(name.clone(), id.to_owned());
-                        }
-                        let mut entry = Map::new();
-                        entry.insert("name".into(), json!(name));
-                        entry.extend(svc.as_object().unwrap().clone());
-                        services.push(Value::Object(entry));
-                    }
-                    self.app(d, "registered", json!({ "services": services }));
+                    self.edge_message(kind, payload, d);
                 }
-                "register_error" => {
-                    let d = self.dial(conn_of(payload))?;
-                    let name = self.name_of(d);
-                    let mut entry = Map::new();
-                    entry.insert("name".into(), json!(name));
-                    entry.insert("code".into(), payload["code"].clone());
-                    if let Some(m) = payload.get("message") {
-                        entry.insert("message".into(), m.clone());
-                    }
-                    if let Some(id) = payload.get("id") {
-                        self.server_ids
-                            .insert(name.clone(), id.as_str().unwrap().to_owned());
-                        entry.insert("id".into(), id.clone());
-                    }
-                    self.app(d, "registered", json!({ "errors": [entry] }));
-                }
-                "app_error" => {
-                    let d = self.dial(conn_of(payload))?;
-                    let mut fields = json!({ "code": payload["code"] });
-                    if let Some(m) = payload.get("message") {
-                        fields["message"] = m.clone();
-                    }
-                    self.app(d, "error", fields);
-                }
-                "disabled" => {
-                    let d = self.dial(conn_of(payload))?;
-                    let mut fields = json!({ "id": self.server_id(d) });
-                    if let Some(r) = payload.get("reason") {
-                        fields["reason"] = r.clone();
-                    }
-                    self.app(d, "disable", fields);
-                }
-                "enabled" => {
-                    let d = self.dial(conn_of(payload))?;
-                    let fields = json!({ "id": self.server_id(d), "name": self.name_of(d) });
-                    self.app(d, "enable", fields);
-                }
-                "conflict" => {
-                    let d = self.dial(conn_of(payload))?;
-                    let mut fields = json!({ "id": self.server_id(d), "name": self.name_of(d) });
-                    if let Some(r) = payload.get("reason") {
-                        fields["reason"] = r.clone();
-                    }
-                    self.app(d, "conflict", fields);
+                "token_provider" => {
+                    let result = payload["result"].as_str().unwrap().to_owned();
+                    self.results.lock().unwrap().push_back(result);
                 }
                 "disconnect" => {
                     let d = self.dial(conn_of(payload))?;
@@ -720,11 +796,20 @@ mod run {
                     let code = payload["code"].as_str().map(str::to_owned);
                     let ws_code = payload["wsCode"].as_u64().map(|c| c as u32);
                     self.disconnect(d, fatal, code, ws_code);
+                    // Received before the end, delivered after it (§2.7
+                    // Ended connection): the same channel keeps the order.
+                    for item in payload["flush_after"].as_array().into_iter().flatten() {
+                        let (kind, payload) = item.as_object().unwrap().iter().next().unwrap();
+                        self.edge_message(kind, payload, d);
+                    }
                 }
                 "drain" => {
                     let d = self.dial(conn_of(payload))?;
                     let reason = payload["reason"].as_str().unwrap_or("rollout").to_owned();
-                    self.drain(d, &reason);
+                    let retry_after = payload["retry_after_ms"]
+                        .as_u64()
+                        .map(Duration::from_millis);
+                    self.drain(d, &reason, retry_after);
                 }
                 "hold" => {
                     // Modelled as "no `unregistered` answer" (the 2 s
@@ -756,6 +841,7 @@ mod run {
                                 ));
                             }
                             self.overloaded = want;
+                            self.overload_paused = false;
                         }
                         _ => {}
                     }
@@ -768,6 +854,20 @@ mod run {
                             last.delay
                         ));
                     }
+                    // The fake supervisor set this delay itself: this only
+                    // proves mcpwarp forwards it. The transport honouring
+                    // retry_after_ms is ws-mixer's
+                    // `drain_honours_retry_after_and_ignores_a_repeat`.
+                    if cause == "drain" {
+                        if let Some(floor) = self.drain_floor.take() {
+                            if last.delay < floor {
+                                return Err(format!(
+                                    "retry (drain): delay {:?} < retry_after {floor:?}",
+                                    last.delay
+                                ));
+                            }
+                        }
+                    }
                     let r = last.reason.as_str();
                     let ok = match cause {
                         "drain" => r == "drain",
@@ -776,11 +876,18 @@ mod run {
                                 && !r.starts_with("register failed: OVERLOADED: ")
                         }
                         "overloaded" => r.starts_with("register failed: OVERLOADED: "),
-                        "dial" | "lost" => r != "drain" && !r.starts_with("register failed"),
+                        "token-refresh" => {
+                            r == "token-refresh" && last.attempt == 1 && last.delay.is_zero()
+                        }
+                        "dial" | "lost" => {
+                            r != "drain"
+                                && r != "token-refresh"
+                                && !r.starts_with("register failed")
+                        }
                         other => return Err(format!("unknown retry cause {other}")),
                     };
                     if !ok {
-                        return Err(format!("retry ({cause}) fired {r:?}"));
+                        return Err(format!("retry ({cause}) fired {last:?}"));
                     }
                     let delay = last.delay;
                     self.advance(delay).await;
@@ -826,13 +933,114 @@ mod run {
             self.edge.app(d as u64 + 1, FakeEdge::envelope(op, fields));
         }
 
+        /// One of the [`FLUSHABLE`] edge messages on dial `d`.
+        fn edge_message(&mut self, kind: &str, payload: &Value, d: usize) {
+            let name = self.name_of(d);
+            match kind {
+                "registered" => {
+                    // README: the OVERLOADED attempt is back to 1 after it.
+                    self.overloaded = 0;
+                    let mut services = Vec::new();
+                    for svc in payload["services"].as_array().unwrap() {
+                        if let Some(id) = svc["id"].as_str() {
+                            self.server_ids.insert(name.clone(), id.to_owned());
+                        }
+                        let mut entry = Map::new();
+                        entry.insert("name".into(), json!(name));
+                        entry.extend(svc.as_object().unwrap().clone());
+                        services.push(Value::Object(entry));
+                    }
+                    self.app(d, "registered", json!({ "services": services }));
+                }
+                "register_error" => {
+                    self.overloaded = 0;
+                    let mut entry = Map::new();
+                    entry.insert("name".into(), json!(name));
+                    entry.insert("code".into(), payload["code"].clone());
+                    if let Some(m) = payload.get("message") {
+                        entry.insert("message".into(), m.clone());
+                    }
+                    if let Some(id) = payload.get("id") {
+                        self.server_ids
+                            .insert(name.clone(), id.as_str().unwrap().to_owned());
+                        entry.insert("id".into(), id.clone());
+                    }
+                    self.app(d, "registered", json!({ "errors": [entry] }));
+                }
+                "app_error" => {
+                    match payload["code"].as_str() {
+                        Some("OVERLOADED") => self.overload_paused = true,
+                        Some("CONNECTION_LIMIT") => {}
+                        _ if !self.overload_paused => self.overloaded = 0,
+                        _ => {}
+                    }
+                    let mut fields = json!({ "code": payload["code"] });
+                    if let Some(m) = payload.get("message") {
+                        fields["message"] = m.clone();
+                    }
+                    self.app(d, "error", fields);
+                }
+                "disabled" => {
+                    // `id`: another (maybe unknown) server id, never adopted
+                    // as the agent's.
+                    let id = payload
+                        .get("id")
+                        .cloned()
+                        .unwrap_or_else(|| json!(self.server_id(d)));
+                    let mut fields = json!({ "id": id });
+                    if let Some(r) = payload.get("reason") {
+                        fields["reason"] = r.clone();
+                    }
+                    self.app(d, "disable", fields);
+                }
+                "enabled" => {
+                    let fields = json!({ "id": self.server_id(d), "name": name });
+                    self.app(d, "enable", fields);
+                }
+                "conflict" => {
+                    let mut fields = json!({ "id": self.server_id(d), "name": name });
+                    if let Some(r) = payload.get("reason") {
+                        fields["reason"] = r.clone();
+                    }
+                    self.app(d, "conflict", fields);
+                }
+                other => unreachable!("not an edge message: {other}"),
+            }
+        }
+
         // --- the client's supervisor --------------------------------------------
 
-        fn new_dial(&mut self, client: usize) {
+        /// A dial attempt of `client`. With a provider, its call comes
+        /// first: a failed call ends the attempt before the socket, so it is
+        /// no dial (README `token_provider`). `true` if that injected events.
+        fn new_dial(&mut self, client: usize) -> bool {
+            if let Some(Token::Provider(p)) = self.clients[client].provider.clone() {
+                let outcome = p
+                    .token()
+                    .now_or_never()
+                    .expect("the runner's provider answers at once");
+                if let Err(e) = outcome {
+                    let fatal = matches!(e, TokenError::Fatal(_));
+                    let source = std::error::Error::source(&e).map(ToString::to_string);
+                    let reason = DisconnectReason::new_for_test()
+                        .with_conn_id(None)
+                        .with_phase(Phase::Dial)
+                        .with_fatal(fatal)
+                        .with_message(format!("{e}: {}", source.unwrap_or_default()));
+                    if fatal {
+                        self.edge.disconnected(reason);
+                        self.clients[client].dead = true;
+                    } else {
+                        self.schedule(client, None, Plan::Backoff, reason);
+                    }
+                    return true;
+                }
+            }
             self.dials.push(Dial {
                 client,
                 ..Dial::default()
             });
+            false
         }
 
         /// Ends dial `d`; its stability window counts if it had passed.
@@ -845,6 +1053,7 @@ mod run {
                     if Instant::now() >= at {
                         c.attempt = 0;
                         c.keepalive_used = false;
+                        c.refresh_spent = false;
                     }
                     c.stable = None;
                 }
@@ -861,6 +1070,7 @@ mod run {
                 if Instant::now() >= at {
                     c.attempt = 0;
                     c.keepalive_used = false;
+                    c.refresh_spent = false;
                     c.stable = None;
                 }
             }
@@ -877,17 +1087,47 @@ mod run {
             (c.attempt, delay)
         }
 
-        fn schedule(&mut self, client: usize, d: usize, plan: Plan, reason: DisconnectReason) {
+        fn schedule(
+            &mut self,
+            client: usize,
+            conn_id: Option<ConnId>,
+            plan: Plan,
+            reason: DisconnectReason,
+        ) {
             let (attempt, delay) = self.delay(client, plan);
             self.edge.disconnected(reason.with_retry_in(Some(delay)));
             self.edge.redial(
                 RedialNotice::new_for_test()
-                    .with_conn_id(Some(conn(d)))
+                    .with_conn_id(conn_id)
                     .with_cause(RedialCause::Failure)
                     .with_attempt(attempt)
                     .with_delay(delay),
             );
             self.clients[client].timer = Some(Instant::now() + delay);
+        }
+
+        /// Whether a token rejected before `welcome` gets its one refresh.
+        fn can_refresh(&self, client: usize) -> bool {
+            let c = &self.clients[client];
+            matches!(c.provider, Some(Token::Provider(_))) && !c.refresh_spent
+        }
+
+        /// The refresh after a rejected token: a non-fatal `Disconnected`,
+        /// then `Redial{TokenRefresh}` at once (CLIENT-SDK.md's Rejected
+        /// token row). Faked here for fixture 38; the real supervisor is
+        /// covered by ws-mixer's `redial_token_refresh_follows_a_non_fatal_disconnected`.
+        fn refresh(&mut self, client: usize, d: usize, reason: DisconnectReason) {
+            self.clients[client].refresh_spent = true;
+            self.edge
+                .disconnected(reason.with_fatal(false).with_retry_in(Some(Duration::ZERO)));
+            self.edge.redial(
+                RedialNotice::new_for_test()
+                    .with_conn_id(Some(conn(d)))
+                    .with_cause(RedialCause::TokenRefresh)
+                    .with_attempt(1)
+                    .with_delay(Duration::ZERO),
+            );
+            self.clients[client].timer = Some(Instant::now());
         }
 
         fn dial_failed(&mut self, d: usize, status: Option<u16>) {
@@ -896,19 +1136,24 @@ mod run {
                 return;
             }
             self.end(d);
-            let fatal = matches!(status, Some(401 | 403 | 404));
+            let refresh = status == Some(401) && self.can_refresh(client);
+            let fatal = !refresh && matches!(status, Some(401 | 403 | 404));
             let reason = DisconnectReason::new_for_test()
                 .with_conn_id(Some(conn(d)))
                 .with_phase(Phase::Dial)
                 .with_http_status(status)
                 .with_fatal(fatal)
                 .with_message(status.map_or("connection refused".into(), |s| format!("HTTP {s}")));
+            if refresh {
+                self.refresh(client, d, reason);
+                return;
+            }
             if fatal {
                 self.edge.disconnected(reason);
                 self.clients[client].dead = true;
                 return;
             }
-            self.schedule(client, d, Plan::Backoff, reason);
+            self.schedule(client, Some(conn(d)), Plan::Backoff, reason);
         }
 
         fn disconnect(
@@ -931,6 +1176,8 @@ mod run {
                 Phase::Dial
             };
             let was_active = self.clients[client].active == Some(d);
+            let rejected = phase != Phase::Connected
+                && (ws_code == Some(4011) || code.as_deref() == Some("UNAUTHORIZED"));
             self.end(d);
             let reason = DisconnectReason::new_for_test()
                 .with_conn_id(Some(conn(d)))
@@ -939,6 +1186,10 @@ mod run {
                 .with_error_name(code.map(|c| &*Box::leak(c.into_boxed_str())))
                 .with_fatal(fatal)
                 .with_message(format!("closed {}", ws_code.unwrap_or(1006)));
+            if !fatal && rejected && self.clients[client].running() && self.can_refresh(client) {
+                self.refresh(client, d, reason);
+                return;
+            }
             if fatal {
                 self.edge.disconnected(reason);
                 self.clients[client].dead = true;
@@ -969,7 +1220,7 @@ mod run {
                     }
                 }
             };
-            self.schedule(client, d, plan, reason);
+            self.schedule(client, Some(conn(d)), plan, reason);
         }
 
         fn welcome(&mut self, d: usize) {
@@ -982,7 +1233,12 @@ mod run {
             c.stable = Some((d, Instant::now() + STABLE_AFTER));
         }
 
-        fn drain(&mut self, d: usize, reason: &str) {
+        /// A `drain`; `retry_after` is used as is for the replacement dial,
+        /// as the transport does (within WIRE.md §2.9's hint + 0-2000 ms).
+        /// The floor check against it only proves mcpwarp forwards the delay;
+        /// the transport honouring `retry_after_ms` is covered by ws-mixer's
+        /// `drain_honours_retry_after_and_ignores_a_repeat`.
+        fn drain(&mut self, d: usize, reason: &str, retry_after: Option<Duration>) {
             let parsed = match reason {
                 "rollout" => DrainReason::Rollout,
                 "overload" => DrainReason::Overload,
@@ -995,7 +1251,8 @@ mod run {
                 DrainNotice::new_for_test()
                     .with_conn_id(conn(d))
                     .with_reason(parsed)
-                    .with_raw_reason(reason.to_owned()),
+                    .with_raw_reason(reason.to_owned())
+                    .with_retry_after(retry_after),
             );
             let client = self.dials[d].client;
             // `replaced` is vetoed (no replacement); a drain of anything but
@@ -1007,14 +1264,16 @@ mod run {
                 return;
             }
             self.clients[client].active = None;
+            self.drain_floor = retry_after;
+            let delay = retry_after.unwrap_or(DRAIN_DELAY);
             self.edge.redial(
                 RedialNotice::new_for_test()
                     .with_conn_id(Some(conn(d)))
                     .with_cause(RedialCause::Drain)
                     .with_attempt(0)
-                    .with_delay(DRAIN_DELAY),
+                    .with_delay(delay),
             );
-            self.clients[client].timer = Some(Instant::now() + DRAIN_DELAY);
+            self.clients[client].timer = Some(Instant::now() + delay);
         }
 
         /// Follows what the SDK did: new clients (each a dial), `register`
@@ -1024,10 +1283,23 @@ mod run {
             let mut injected = false;
             while self.seen_connects < self.edge.connects() {
                 self.seen_connects += 1;
-                self.clients.push(Client::default());
-                // The SDK's OVERLOADED attempt is per session.
+                // Configures are serialized: the newest one's client.
+                let provider = self
+                    .providers
+                    .as_ref()
+                    .zip(self.last_token.as_ref())
+                    .and_then(|(p, t)| p.get(t).cloned());
+                self.clients.push(Client {
+                    provider,
+                    ..Client::default()
+                });
+                // The SDK counts OVERLOADED per connection (§2.6); the runner
+                // resets its count per runner client (one per ws-mixer client
+                // build), which every fixture's single-connection
+                // OVERLOADED runs fit.
                 self.overloaded = 0;
-                self.new_dial(self.clients.len() - 1);
+                self.overload_paused = false;
+                injected |= self.new_dial(self.clients.len() - 1);
             }
             let sent = self.edge.sent();
             for body in &sent[self.seen_sent..] {
@@ -1104,7 +1376,7 @@ mod run {
                     .collect();
                 for c in due {
                     self.clients[c].timer = None;
-                    self.new_dial(c);
+                    let _ = self.new_dial(c);
                 }
                 self.quiesce().await;
             }

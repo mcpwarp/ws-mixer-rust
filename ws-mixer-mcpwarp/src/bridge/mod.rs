@@ -320,16 +320,21 @@ async fn serve(stream: Stream, ctx: ServeContext, responder: handler::Responder)
         }
         Ok(Ok(raw)) => raw,
         Ok(Err(ReadError::Http(e))) => {
-            return refuse(reader.into_inner(), e.status, &e.message, false).await;
+            let head_request = http1::is_head_request_line(reader.buffered());
+            return refuse(reader.into_inner(), e.status, &e.message, head_request).await;
         }
         Ok(Err(ReadError::Eof)) => {
-            return refuse(reader.into_inner(), 400, "incomplete request", false).await;
+            let head_request = http1::is_head_request_line(reader.buffered());
+            return refuse(reader.into_inner(), 400, "incomplete request", head_request).await;
         }
         Ok(Err(ReadError::Io)) => return,
     };
     let head = match http1::parse_head(&raw) {
         Ok(h) => h,
-        Err(e) => return refuse(reader.into_inner(), e.status, &e.message, false).await,
+        Err(e) => {
+            let head_request = http1::is_head_request_line(&raw);
+            return refuse(reader.into_inner(), e.status, &e.message, head_request).await;
+        }
     };
     let request_state = ctx.request_state.as_ref().map(|f| {
         f(&RequestInfo {

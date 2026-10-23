@@ -22,7 +22,7 @@
 //! | Observation | When | Public event |
 //! |---|---|---|
 //! | `State(s)` | every state change, incl. `Closing` on a drop-before-settle | `watch_state` |
-//! | `Registered(r)` | every successful `register`; `r.url` is the public URL | `Registered` |
+//! | `Registered{registration, disabled_next}` | every successful `register`; `registration.url` is the public URL; `disabled_next` when a held `disable` applies with it (a `Disabled` follows) | `Registered` |
 //! | `Disabled{..}` | `disable` op or `SERVER_DISABLED` refusal | `Disabled` |
 //! | `Enabled{..}` | matching `enable`; a `register` follows | `Enabled` |
 //! | `Conflict(c)` | take-over **after** settle (before settle: no `Conflict`; `Close` carries `TAKEN_OVER`) | `Conflict` |
@@ -61,8 +61,13 @@ pub(crate) type Observe = dyn Fn(&ExposeObservation) + Send + Sync;
 pub(crate) enum ExposeObservation {
     /// The state changed.
     State(ExposeState),
-    /// A successful `register`.
-    Registered(Registration),
+    /// A successful `register`. `disabled_next`: it brought a held
+    /// `disable`'s id, so a `Disabled` follows at once (MCPWARP.md §5.9 Held
+    /// `disable`, T50).
+    Registered {
+        registration: Registration,
+        disabled_next: bool,
+    },
     /// Disabled.
     Disabled {
         server_id: Option<String>,

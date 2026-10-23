@@ -244,7 +244,12 @@ impl Driver {
         match event {
             SessionEvent::State(s) => shared.set_state(s),
             SessionEvent::Registered(reg) => {
-                shared.observe(&ExposeObservation::Registered(reg.clone()));
+                // Commands run after the whole input: a held `disable` that
+                // this `registered` applied already shows in the state.
+                shared.observe(&ExposeObservation::Registered {
+                    registration: reg.clone(),
+                    disabled_next: self.session.state() == ExposeState::Disabled,
+                });
                 shared.emit(ExposeEvent::Registered(reg));
                 self.settle_ok();
             }

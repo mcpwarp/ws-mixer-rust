@@ -389,11 +389,14 @@ impl Supervisor {
                 kind: RetryKind::RefreshNow,
                 ..
             } => {
-                // No Disconnected: the refresh is part of the same connect
-                // attempt (Go dialAndHandshake, JS connectOnce). Only the
-                // redial itself is announced (MCPWARP.md §5.9 onRetry).
+                // A failed dial like any other, then the one immediate
+                // redial (CLIENT-SDK.md Rejected token, MCPWARP.md §11 row 53).
+                reason.fatal = false;
+                reason.retry_in = Some(Duration::ZERO);
                 tracing::info!(conn_id = ?reason.conn_id, "token rejected ({}); refreshing it and redialing", reason.message);
-                self.emit_redial(reason.conn_id, 1, Duration::ZERO, RedialCause::TokenRefresh);
+                let conn_id = reason.conn_id;
+                self.emit_disconnected(reason);
+                self.emit_redial(conn_id, 1, Duration::ZERO, RedialCause::TokenRefresh);
                 self.next_dial = None;
                 self.start_dial();
             }

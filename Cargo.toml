@@ -5,7 +5,7 @@ resolver = "3"
 
 [package]
 name = "ws-mixer"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Rust client SDK for the ws-mixer.v1 protocol: N byte streams multiplexed over one WebSocket"

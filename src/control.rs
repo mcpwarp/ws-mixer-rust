@@ -275,8 +275,11 @@ fn protocol<T>(message: String) -> Check<T> {
 ///
 /// Order: size, JSON parse, is an object, has `t`, `t` is a string, `t` is
 /// one of the seven v1 types, then per-field checks in field-table order.
-/// Unknown fields are ignored. Integers must be JSON integers: any number
-/// serde_json reads as a float (`1.0`, `1e3`, or beyond `u64`) is rejected.
+/// Unknown fields are ignored. An integer field takes any JSON number whose
+/// value is integral (`1.0` and `1e0` are `1`, WIRE.md §2.7 Integer fields),
+/// then its range check; a number with a fraction or a boolean is rejected.
+/// A number serde_json reads as a float (a fraction, an exponent, or beyond
+/// `u64`) is judged on its `f64` value, so beyond 2^53 it is already rounded.
 ///
 /// `allow_subfloor_timing` (conformance only) skips the `welcome`
 /// `ping_interval >= 5000` and `ping_timeout >= 2 * ping_interval` checks;
@@ -362,11 +365,17 @@ fn parse_inner(bytes: &[u8], allow_subfloor_timing: bool) -> Check<ControlMsg> {
 }
 
 fn parse_version(f: &mut Fields) -> Check<u32> {
-    let v = f.req_int("v", ANY_INT)?;
-    if v != 1 {
+    let v = f.required("v")?;
+    // An integral beyond i128 is just another unsupported version.
+    let n = match as_integer(&v) {
+        Some(Integral::Huge) => None,
+        _ => Some(f.int("v", &v, ANY_INT)?),
+    };
+    if n != Some(1) {
+        let shown = n.map_or_else(|| v.to_string(), |n| n.to_string());
         return Err((
             ErrorCode::UNSUPPORTED,
-            format!("{}.v {v} is not supported: ws-mixer.v1 requires 1", f.t),
+            format!("{}.v {shown} is not supported: ws-mixer.v1 requires 1", f.t),
         ));
     }
     Ok(1)
@@ -508,12 +517,23 @@ impl Fields {
     }
 
     fn int(&self, name: &str, v: &Value, range: RangeInclusive<i128>) -> Check<i128> {
-        let Some(n) = as_integer(v) else {
-            return protocol(format!(
-                "{}.{name} must be an integer, got {}",
-                self.t,
-                describe(v)
-            ));
+        let n = match as_integer(v) {
+            Some(Integral::Value(n)) => n,
+            Some(Integral::Huge) => {
+                return protocol(format!(
+                    "{}.{name} {v} out of range {}..={}",
+                    self.t,
+                    range.start(),
+                    range.end()
+                ));
+            }
+            None => {
+                return protocol(format!(
+                    "{}.{name} must be an integer, got {}",
+                    self.t,
+                    describe(v)
+                ));
+            }
         };
         if !range.contains(&n) {
             return protocol(format!(
@@ -632,16 +652,34 @@ pub(crate) fn valid_capability(s: &str) -> bool {
             .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-'))
 }
 
-/// The value of a JSON integer. `None` for every non-number and for every
-/// number serde_json parsed as a float.
-fn as_integer(v: &Value) -> Option<i128> {
-    match v {
-        Value::Number(n) if !n.is_f64() => n
-            .as_u64()
-            .map(i128::from)
-            .or_else(|| n.as_i64().map(i128::from)),
-        _ => None,
+/// An integral JSON number.
+enum Integral {
+    Value(i128),
+    /// An integral float beyond `i128`, outside every field's range.
+    Huge,
+}
+
+/// The value of an integral JSON number. `None` for every non-number and for
+/// every number with a fraction.
+fn as_integer(v: &Value) -> Option<Integral> {
+    let Value::Number(n) = v else { return None };
+    if let Some(n) = n.as_u64() {
+        return Some(Integral::Value(n.into()));
     }
+    if let Some(n) = n.as_i64() {
+        return Some(Integral::Value(n.into()));
+    }
+    // serde_json never holds a non-finite float.
+    let f = n.as_f64()?;
+    if f.fract() != 0.0 {
+        return None;
+    }
+    const LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0; // 2^127
+    Some(if (-LIMIT..LIMIT).contains(&f) {
+        Integral::Value(f as i128)
+    } else {
+        Integral::Huge
+    })
 }
 
 /// A short description of `v` for error messages, carrying the wire value
@@ -658,7 +696,7 @@ fn describe(v: &Value) -> String {
 }
 
 fn describe_number(n: &Number) -> String {
-    if n.is_f64() {
+    if n.as_f64().is_some_and(|f| f.fract() != 0.0) {
         format!("non-integer number {n}")
     } else {
         format!("number {n}")
@@ -864,15 +902,67 @@ mod tests {
     }
 
     #[test]
-    fn floats_rejected_in_integer_fields() {
+    fn integral_floats_accepted_as_integers() {
+        let base = parse(WELCOME).unwrap();
         for (field, value) in [
             ("v", "1.0"),
+            ("v", "1e0"),
             ("window", "262144.0"),
             ("window", "2.62144e5"),
-            ("max_streams", "64.5"),
+            ("max_streams", "6.4e1"),
             ("ping_interval", "3e4"),
             ("ping_timeout", "90000.0"),
-            ("ping_timeout", "18446744073709551616"),
+        ] {
+            assert_eq!(
+                parse(&welcome_with(field, value)).unwrap(),
+                base,
+                "{field}={value}"
+            );
+        }
+        let e = err(&welcome_with("v", "7e0"));
+        assert_eq!(e.code, ErrorCode::UNSUPPORTED);
+        assert!(e.message.contains("welcome.v 7 is not supported"), "{e}");
+        assert_eq!(
+            err(&welcome_with("v", "1e300")).code,
+            ErrorCode::UNSUPPORTED
+        );
+        assert_eq!(
+            parse(r#"{"t":"ping","id":1.0,"ts":-5e0}"#).unwrap(),
+            ControlMsg::Ping(Ping {
+                id: 1,
+                ts: Some(-5)
+            })
+        );
+        assert_eq!(
+            parse(r#"{"t":"drain","reason":"rollout","last_stream_id":1.0,"deadline_ms":1e3,"retry_after_ms":-0.0}"#)
+                .unwrap(),
+            ControlMsg::Drain(Drain {
+                reason: "rollout".into(),
+                last_stream_id: 1,
+                deadline_ms: Some(1000),
+                retry_after_ms: Some(0),
+                message: None,
+            })
+        );
+        assert_eq!(
+            parse(r#"{"t":"error","code":1.0,"message":"x","stream_id":3e0,"last_stream_id":4.0}"#)
+                .unwrap(),
+            ControlMsg::Error(ErrorMsg {
+                code: 1,
+                message: "x".into(),
+                stream_id: Some(3),
+                last_stream_id: Some(4),
+            })
+        );
+    }
+
+    #[test]
+    fn fractional_and_out_of_range_floats_rejected() {
+        for (field, value) in [
+            ("v", "1.5"),
+            ("window", "262144.5"),
+            ("max_streams", "64.5"),
+            ("ping_interval", "3.00001e4"),
         ] {
             let e = err(&welcome_with(field, value));
             assert_eq!(e.code, ErrorCode::PROTOCOL_ERROR, "{field}={value}");
@@ -884,14 +974,39 @@ mod tests {
             );
         }
         for raw in [
-            r#"{"t":"ping","id":1.0}"#,
+            r#"{"t":"ping","id":1.5}"#,
             r#"{"t":"pong","id":1,"ts":5.5}"#,
-            r#"{"t":"drain","reason":"rollout","last_stream_id":1,"deadline_ms":1e3}"#,
-            r#"{"t":"error","code":1.0,"message":"x 1"}"#,
-            r#"{"t":"error","code":1,"message":"x","stream_id":3.0}"#,
+            r#"{"t":"drain","reason":"rollout","last_stream_id":1,"deadline_ms":1e-3}"#,
+            r#"{"t":"error","code":1.5,"message":"x 1"}"#,
+            r#"{"t":"error","code":1,"message":"x","stream_id":3.25}"#,
         ] {
             assert!(err(raw).message.contains("non-integer number"), "{raw}");
         }
+        for (field, value, needle) in [
+            ("window", "1e10", "welcome.window 10000000000 out of range"),
+            ("window", "16383.0", "welcome.window 16383 out of range"),
+            (
+                "ping_timeout",
+                "18446744073709551616",
+                "welcome.ping_timeout 18446744073709551616 out of range",
+            ),
+            (
+                "max_streams",
+                "1e300",
+                "welcome.max_streams 1e+300 out of range",
+            ),
+        ] {
+            let e = err(&welcome_with(field, value));
+            assert_eq!(e.code, ErrorCode::PROTOCOL_ERROR, "{field}={value}");
+            assert!(e.message.contains(needle), "{field}={value}: {e}");
+        }
+        let e = err(&welcome_with("v", "true"));
+        assert_eq!(e.code, ErrorCode::PROTOCOL_ERROR);
+        assert!(
+            e.message
+                .contains("welcome.v must be an integer, got boolean true"),
+            "{e}"
+        );
         // Floats inside opaque objects are the application's business.
         assert!(parse(r#"{"t":"app","body":{"x":1.5}}"#).is_ok());
     }
@@ -1015,7 +1130,7 @@ mod tests {
         assert!(parse_control(raw.as_bytes(), false).is_err());
         assert!(parse_control(raw.as_bytes(), true).is_ok());
         for (field, value) in [
-            ("ping_interval", "100.0"),
+            ("ping_interval", "100.5"),
             ("ping_interval", "\"100\""),
             ("ping_interval", "-1"),
             ("ping_interval", "0"),

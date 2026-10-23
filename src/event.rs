@@ -59,18 +59,16 @@ pub enum Event {
     /// expected to call [`Client::close_immediate`](crate::Client::close_immediate).
     Drain(DrainNotice),
     /// A connection attempt failed or a connection ended. Emitted exactly once
-    /// per attempt, with one exception: a token rejected before `welcome`
-    /// (HTTP 401 or close 4011) that the provider gets to refresh is retried
-    /// at once without a `Disconnected`, as in the Go and JS SDKs (only an
-    /// [`Event::Redial`] with [`RedialCause::TokenRefresh`] announces it);
-    /// only the outcome of the retry is reported. A dial cancelled by
+    /// per attempt, including a token rejected before `welcome` (HTTP 401 or
+    /// close 4011) that the provider gets to refresh: that one is non-fatal
+    /// with `retry_in` zero, followed by an [`Event::Redial`] with
+    /// [`RedialCause::TokenRefresh`]. A dial cancelled by
     /// [`Client::close`](crate::Client::close) reports nothing. When `fatal`
     /// is set, no further reconnect happens.
     Disconnected(DisconnectReason),
     /// The client scheduled its next dial: a reconnect after a failure, a
-    /// drain's replacement, or the silent token-refresh redial. Emitted after
-    /// the `Disconnected` or `Drain` event it follows (the token refresh has
-    /// none) and before that dial starts. A drain whose reason is vetoed with
+    /// drain's replacement, or the token-refresh redial. Emitted after the
+    /// `Disconnected` or `Drain` event it follows and before that dial starts. A drain whose reason is vetoed with
     /// [`ClientBuilder::no_redial_on_drain`](crate::ClientBuilder::no_redial_on_drain)
     /// gets none, and neither does that connection's end: the application is
     /// expected to call [`Client::close_immediate`](crate::Client::close_immediate).
@@ -87,7 +85,7 @@ pub enum RedialCause {
     /// The server drained the connection; this dial is its replacement.
     Drain,
     /// A token rejected before `welcome` (HTTP 401 or close 4011) is
-    /// refreshed and redialed at once. No `Disconnected` precedes it.
+    /// refreshed and redialed at once, after its non-fatal `Disconnected`.
     TokenRefresh,
 }
 

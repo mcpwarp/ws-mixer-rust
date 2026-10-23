@@ -24,7 +24,7 @@ use bytes::Bytes;
 use http_body_util::Full;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
-use ws_mixer::{BuildError, ClientBuilder, Phase, ReconnectPolicy, Token};
+use ws_mixer::{BuildError, ClientBuilder, Phase, ReconnectPolicy, Token, TokenProvider};
 
 use super::status::{TunnelState, TunnelStatus, TunnelStatusCode, last_error};
 use super::{DEFAULT_DISPOSE_TIMEOUT, StatusHub, TunnelConfig, TunnelOptions, lock};
@@ -156,20 +156,55 @@ pub(crate) fn js_trim(s: &str) -> &str {
     s.trim_matches(|c: char| (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}')
 }
 
+/// A config's token (§6.2): its provider when set, else `token`.
+#[derive(Clone, Copy)]
+enum ConfigToken<'a> {
+    Unset,
+    Text(&'a str),
+    Provider(&'a Arc<dyn TokenProvider>),
+}
+
+fn config_token(c: &TunnelConfig) -> ConfigToken<'_> {
+    match &c.token_provider {
+        Some(Token::Provider(p)) => ConfigToken::Provider(p),
+        Some(Token::Static(t)) => ConfigToken::Text(t),
+        None => c
+            .token
+            .as_deref()
+            .map_or(ConfigToken::Unset, ConfigToken::Text),
+    }
+}
+
+/// The token a start hands the transport. A provider goes as is: called on
+/// every dial.
+pub(super) fn expose_token(c: &TunnelConfig) -> Token {
+    match config_token(c) {
+        ConfigToken::Provider(p) => Token::Provider(p.clone()),
+        ConfigToken::Text(t) => Token::from(js_trim(t)),
+        ConfigToken::Unset => Token::from(""),
+    }
+}
+
 /// §6.2 check 3: disabled or a blank token is `off`.
 fn will_start(c: &TunnelConfig) -> bool {
-    c.enabled && c.token.as_deref().is_some_and(|t| !js_trim(t).is_empty())
+    c.enabled
+        && match config_token(c) {
+            ConfigToken::Unset => false,
+            ConfigToken::Text(t) => !js_trim(t).is_empty(),
+            ConfigToken::Provider(_) => true,
+        }
 }
 
 /// §6.2 checks 4 and 5 (1, 2, 6 and 7 cannot fail in Rust): the log detail
 /// and the problem.
 fn invalid(c: &TunnelConfig) -> Option<(&'static str, Problem)> {
-    if !c.enabled || c.token.as_deref().is_some_and(|t| js_trim(t).is_empty()) {
+    let token = config_token(c);
+    if !c.enabled || matches!(token, ConfigToken::Text(t) if js_trim(t).is_empty()) {
         return None;
     }
-    if c.token.is_none() {
+    if matches!(token, ConfigToken::Unset) {
         return Some((
-            "`token` must be a string",
+            "`token` must be a string or a provider",
             problem(TunnelStatusCode::InvalidConfig, last_error::TOKEN_NOT_SET),
         ));
     }
@@ -182,13 +217,15 @@ fn invalid(c: &TunnelConfig) -> Option<(&'static str, Problem)> {
     None
 }
 
-/// §6.2 step 3.
+/// §6.2 step 3: a string token trimmed, a provider by identity.
 fn same_config(a: &TunnelConfig, b: &TunnelConfig) -> bool {
-    a.enabled == b.enabled
-        && a.token.as_deref().map(js_trim) == b.token.as_deref().map(js_trim)
-        && a.name == b.name
-        && a.url == b.url
-        && a.kind == b.kind
+    let same_token = match (config_token(a), config_token(b)) {
+        (ConfigToken::Unset, ConfigToken::Unset) => true,
+        (ConfigToken::Text(x), ConfigToken::Text(y)) => js_trim(x) == js_trim(y),
+        (ConfigToken::Provider(x), ConfigToken::Provider(y)) => Arc::ptr_eq(x, y),
+        _ => false,
+    };
+    a.enabled == b.enabled && same_token && a.name == b.name && a.url == b.url && a.kind == b.kind
 }
 
 /// §5.2 row 11 for the tunnel's policy, checked with `template`'s valid
@@ -556,7 +593,7 @@ impl Actor {
 
         let mut expose = self.options.template.clone();
         expose.url = config.url.clone().unwrap_or_else(|| DEFAULT_URL.to_owned());
-        expose.token = Token::from(js_trim(config.token.as_deref().unwrap_or_default()));
+        expose.token = expose_token(&config);
         expose.name = name.clone();
         expose.kind = config.kind.unwrap_or_default();
         expose.reconnect = self.options.reconnect.clone();
@@ -691,10 +728,15 @@ impl Actor {
                 }
             }
             ExposeObservation::State(_) => {}
-            ExposeObservation::Registered(r) => {
-                log!(info, "online at {}", r.url);
+            // T50: the `Disabled` right behind it is the one snapshot.
+            ExposeObservation::Registered {
+                disabled_next: true,
+                ..
+            } => {}
+            ExposeObservation::Registered { registration, .. } => {
+                log!(info, "online at {}", registration.url);
                 self.set_status(TunnelStatus {
-                    url: Some(r.url),
+                    url: Some(registration.url),
                     ..TunnelStatus::new(TunnelState::Online)
                 });
             }
@@ -895,7 +937,7 @@ mod tests {
         assert!(invalid(&c(true, Some(" "), None)).is_none());
         assert!(!will_start(&c(true, Some(" \u{feff}"), Some("n"))));
         let (detail, p) = invalid(&c(true, None, Some("n"))).unwrap();
-        assert_eq!(detail, "`token` must be a string");
+        assert_eq!(detail, "`token` must be a string or a provider");
         assert_eq!(p.last_error, last_error::TOKEN_NOT_SET);
         let (detail, p) = invalid(&c(true, Some("t"), None)).unwrap();
         assert_eq!(detail, "`name` must be a string");
@@ -912,6 +954,59 @@ mod tests {
                 ..c(true, Some("t"), Some("n"))
             }
         ));
+    }
+
+    #[test]
+    fn provider_config_checks() {
+        let provider = || Token::provider(|| async { Ok("t".to_owned()) });
+        let with = |token: Option<&str>, p: Option<Token>| TunnelConfig {
+            enabled: true,
+            token: token.map(Into::into),
+            token_provider: p,
+            name: Some("n".into()),
+            ..TunnelConfig::default()
+        };
+        let p = provider();
+        // A provider alone starts, and wins over a blank or missing token.
+        assert!(invalid(&with(None, Some(p.clone()))).is_none());
+        assert!(will_start(&with(None, Some(p.clone()))));
+        assert!(will_start(&with(Some(" "), Some(p.clone()))));
+        // Identity, not behaviour.
+        assert!(same_config(
+            &with(None, Some(p.clone())),
+            &with(Some("other"), Some(p.clone()))
+        ));
+        assert!(!same_config(
+            &with(None, Some(p.clone())),
+            &with(None, Some(provider()))
+        ));
+        assert!(!same_config(&with(Some("t"), None), &with(None, Some(p))));
+        // A static token there is a string token.
+        let s = with(None, Some(Token::from(" t ")));
+        assert!(will_start(&s));
+        assert!(same_config(&s, &with(Some("t"), None)));
+        assert!(!will_start(&with(Some("t"), Some(Token::from(" ")))));
+    }
+
+    #[test]
+    fn provider_config_eq_and_debug() {
+        let p = Token::provider(|| async { Ok("secret".to_owned()) });
+        let c = TunnelConfig {
+            token_provider: Some(p),
+            ..TunnelConfig::default()
+        };
+        assert_eq!(c, c.clone());
+        assert_ne!(
+            c,
+            TunnelConfig {
+                token_provider: Some(Token::provider(|| async { Ok("secret".to_owned()) })),
+                ..TunnelConfig::default()
+            }
+        );
+        assert_ne!(c, TunnelConfig::default());
+        assert!(format!("{c:?}").contains("Token::Provider(..)"));
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("token_provider"), "{json}");
     }
 
     #[test]

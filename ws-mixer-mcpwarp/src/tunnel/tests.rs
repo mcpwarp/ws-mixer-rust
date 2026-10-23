@@ -9,10 +9,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::FutureExt;
 use http_body_util::Full;
-use ws_mixer::{BuildError, ClientBuilder, ReconnectPolicy};
+use ws_mixer::{BuildError, ClientBuilder, ReconnectPolicy, Token};
 
 use crate::transport::{Connector, Transport};
 
+use super::actor::expose_token;
 use super::status::{TunnelState, TunnelStatus, TunnelStatusCode, last_error};
 use super::{Subscription, Tunnel, TunnelConfig, TunnelOptions, TunnelOptionsBuilder};
 use crate::bridge::handler_fn;
@@ -552,4 +553,37 @@ async fn a_panicking_generation_does_not_wedge_the_queue() {
     edge.connected(1);
     settle().await;
     assert_eq!(edge.sent()[0]["mcpwarp"]["services"][0]["name"], "bravo");
+}
+
+/// The fixtures' fake connector ignores the builder, so the start's token
+/// mapping is checked here: a provider passes through by identity and wins
+/// over `token`, and a string goes trimmed.
+#[test]
+fn expose_token_maps_provider_and_string() {
+    let provider = Token::provider(|| async { Ok("p".to_owned()) });
+    let Token::Provider(arc) = &provider else {
+        unreachable!()
+    };
+    let both = TunnelConfig {
+        token: Some("s".into()),
+        token_provider: Some(provider.clone()),
+        ..config("alpha")
+    };
+    for c in [
+        &TunnelConfig {
+            token: None,
+            ..both.clone()
+        },
+        &both,
+    ] {
+        match expose_token(c) {
+            Token::Provider(p) => assert!(Arc::ptr_eq(&p, arc)),
+            Token::Static(_) => panic!("provider mapped to a static token"),
+        }
+    }
+    let text = TunnelConfig {
+        token: Some(" \u{feff}mcpwarp_pat_x\n".into()),
+        ..config("alpha")
+    };
+    assert!(matches!(expose_token(&text), Token::Static(t) if t == "mcpwarp_pat_x"));
 }

@@ -1,7 +1,9 @@
 //! `spec/fixtures/mcpwarp/envelope` (MCPWARP.md §10.2), as an agent runner:
 //!
 //! - `register` / `unregister` valid cases: the encoder's output equals
-//!   `message`, byte for byte.
+//!   `message`, byte for byte. The encoder sends one service per frame
+//!   (single-service profile), so a valid case with several services is
+//!   agent output this SDK never produces; it is listed and skipped (§10.2).
 //! - Edge -> agent cases: `wire_valid: true` decodes without error, with the
 //!   §2.3 defaults; `MALFORMED_ENVELOPE` fails with a message containing
 //!   `message_contains`; `UNSUPPORTED_VERSION` / `UNKNOWN_OP` decode as
@@ -18,9 +20,9 @@ use ws_mixer_mcpwarp::{
     encode_unregister, is_valid_service_name,
 };
 
-/// Floors for the pinned spec (v0.6.2): raise them as the corpus grows.
+/// Floors for the pinned spec (v0.7.2): raise them as the corpus grows.
 const MIN_ENCODED: usize = 3;
-const MIN_DECODED: usize = 46;
+const MIN_DECODED: usize = 49;
 
 #[test]
 fn envelope_fixtures() {
@@ -31,6 +33,7 @@ fn envelope_fixtures() {
     let mut decoded = 0;
     let mut names_checked = 0;
     let mut noted = Vec::new();
+    let mut multi = Vec::new();
     for bucket in ["valid", "invalid"] {
         for path in common::json_files(&root.join("envelope").join(bucket)) {
             let f = common::read_json(&path);
@@ -38,7 +41,11 @@ fn envelope_fixtures() {
             let op = f["op"].as_str().unwrap_or_else(|| panic!("{name}: no op"));
             let wire_valid = f["wire_valid"].as_bool().unwrap();
             let schema_valid = f["schema_valid"].as_bool().unwrap();
+            let services = f["message"]["services"].as_array().map_or(0, Vec::len);
             match op {
+                "register" | "unregister" if schema_valid && wire_valid && services > 1 => {
+                    multi.push(name);
+                }
                 "register" | "unregister" if schema_valid && wire_valid => {
                     check_encoder(&name, op, &f["message"]);
                     encoded += 1;
@@ -63,11 +70,17 @@ fn envelope_fixtures() {
     for name in &noted {
         println!("note: envelope/{name}: agent -> edge invalid case, edge runner only; skipped");
     }
+    for name in &multi {
+        println!(
+            "note: envelope/{name}: agent -> edge case with several services, which a single-service encoder never sends (§10.6); skipped"
+        );
+    }
     println!(
-        "envelope {} ({} asserted, {} noted)",
-        encoded + decoded + noted.len(),
+        "envelope {} ({} asserted, {} noted, {} multi-service skipped)",
+        encoded + decoded + noted.len() + multi.len(),
         encoded + decoded,
-        noted.len()
+        noted.len(),
+        multi.len()
     );
     assert!(encoded >= MIN_ENCODED, "only {encoded} encoder cases ran");
     assert!(decoded >= MIN_DECODED, "only {decoded} decoder cases ran");

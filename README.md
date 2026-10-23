@@ -1,6 +1,6 @@
 # ws-mixer
 
-Rust client SDK for the [ws-mixer.v1](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.2/docs/WIRE.md)
+Rust client SDK for the [ws-mixer.v1](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.7.2/docs/WIRE.md)
 protocol: many independent, flow-controlled byte streams multiplexed over one WebSocket.
 
 The server opens streams; the client accepts each one as a `Stream` implementing tokio's
@@ -15,14 +15,18 @@ server side) and [ws-mixer-js](https://github.com/mcpwarp/ws-mixer-js) (Node cli
 
 ## Status
 
-0.2.0, not yet released. Implements the client role of spec **v0.6.2** (`spec.pin`). The spec
-runner's conformance suite passes in full:
+0.2.1, not yet released; the first version to go to crates.io (0.2.0 was tagged, never
+published). Implements the client role of spec **v0.7.2** (`spec.pin`). The spec runner's
+conformance suite passes in full:
 
-- fixture mode: 24/24 client fixtures
+- fixture mode: 25/25 client fixtures
 - pair mode: 10/10 scenarios with ws-mixer-go **v0.9.0** (`goserver.pin`) as the server
 
-Floors are checked in at `conformance/COUNTS.json`. Fixtures from the upcoming spec v0.6.3 (not
-tagged yet) are picked up when `spec.pin` moves.
+Floors are checked in at `conformance/COUNTS.json`.
+
+New in 0.2.1: control messages accept an integral JSON float (`1.0`, `1e0`) as an integer
+(WIRE.md §2.7), and the first token a provider gets rejected before `welcome` is reported as a
+non-fatal `Event::Disconnected` before its `Event::Redial`.
 
 New in 0.2.0: additive API, with the close and drain behaviour changes listed under "Changed" in
 the CHANGELOG:
@@ -41,7 +45,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the details.
 
 | Crate | Path | Version | What |
 |---|---|---|---|
-| `ws-mixer` | `/` | 0.2.0 | this crate: the ws-mixer.v1 client |
+| `ws-mixer` | `/` | 0.2.1 | this crate: the ws-mixer.v1 client |
 | [`ws-mixer-mcpwarp`](ws-mixer-mcpwarp/) | `ws-mixer-mcpwarp/` | 0.1.1 | the mcpwarp layer on top |
 | `ws-mixer-conformance-adapter` | `conformance/adapter/` | not published | the spec runner's adapter |
 
@@ -51,14 +55,16 @@ own (see [Releasing](#releasing)).
 ## mcpwarp layer
 
 [`ws-mixer-mcpwarp`](ws-mixer-mcpwarp/README.md) implements
-[MCPWARP.md](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.2/docs/MCPWARP.md) §2-§8 of spec
-v0.6.2 on this crate: expose a local MCP server at a public mcpwarp URL. It offers `expose()`
+[MCPWARP.md](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.7.2/docs/MCPWARP.md) §2-§8 of spec
+v0.7.2 on this crate: expose a local MCP server at a public mcpwarp URL. It offers `expose()`
 (one service, one call), `Tunnel` (a controller for apps with a settings UI, with status text in
 six locales) and the Tier 1 building blocks (envelope, codes, identity, the sans-IO registration
-machine, request bridging) for agents that run their own `ws_mixer::Client`. It passes every
-agent-side mcpwarp fixture set of the spec: envelope 63 (49 asserted, 14 edge-runner only),
-bridging 13 of 14 (one applies only to streamed request bodies), tunnel 36/36, status text 102
-table entries and 26 cases.
+machine, request bridging) for agents that run their own `ws_mixer::Client`. It is the
+single-service subset of the spec's multi-service profile (§6A not implemented) and passes every
+single-service agent-side mcpwarp fixture: envelope 68 (52 asserted, 14 edge-runner only, 2
+multi-service skipped), bridging 22 of 27 (one applies only to streamed request bodies, four are
+multi-service), tunnel 44 of 58 (the 14 `ms_*` group fixtures skipped), status text 144 table
+entries and 37 cases.
 
 ## Install
 
@@ -157,10 +163,10 @@ The crate docs spell these out; in short:
 - **`Events` is the lifeline.** Dropping it closes the client gracefully. Dropping only the
   `Client` handles does not. Stop consuming and a connection whose backlog exceeds
   `max(128, max_streams + 64)` app events is failed with `ENHANCE_YOUR_CALM`.
-- **One `Disconnected` per connection attempt**, after all of that connection's other events.
-  Exceptions: a pre-welcome token rejection that a provider refreshes is retried without a
-  `Disconnected`, and a dial abandoned by `close()`, `close_with()`, `close_immediate()` or a
-  `no_redial_on_drain` veto reports nothing.
+- **One `Disconnected` per connection attempt**, after all of that connection's other events,
+  including a pre-welcome token rejection that a provider refreshes (non-fatal, `retry_in` zero,
+  then the immediate redial). The exception: a dial abandoned by `close()`, `close_with()`,
+  `close_immediate()` or a `no_redial_on_drain` veto reports nothing.
 - **Every scheduled dial is announced.** `Event::Redial` carries the cause (failure, drain
   replacement, token refresh), the attempt number and the delay actually used; it follows the
   `Disconnected` or `Drain` it answers.
@@ -193,7 +199,7 @@ make conformance-pair      # spec runner, ws-mixer-go server x this client (need
 cargo deny check           # licenses, advisories, duplicate crates
 ```
 
-`make fetch-spec` and `make fetch-goserver` shallow-clone ws-mixer-spec at `spec.pin` (v0.6.2)
+`make fetch-spec` and `make fetch-goserver` shallow-clone ws-mixer-spec at `spec.pin` (v0.7.2)
 into `.spec/` and ws-mixer-go at `goserver.pin` (v0.9.0) into `.goserver/`, re-cloning when the
 pin changes; the conformance targets do this on their own. The spec fixture tests look in
 `$WSMIXER_SPEC_DIR`, then `.spec/` (ws-mixer also tries `../ws-mixer-spec`), and are skipped when
@@ -218,10 +224,16 @@ How a desktop host that exposes several local MCP servers should use the mcpwarp
   `describe_status`.
 - **One `session::Session` per service.** On every `Connected`, call `on_welcome` on each session
   and execute the `Command::SendApp` commands it queues (that is the `register`); do not call
-  `encode_register` yourself. Feed every session the same transport events (`on_app`,
-  `on_drain`, `on_disconnected`); a session ignores envelopes for other names. A session created
-  while a connection is already live needs `on_welcome(<live conn>)` from you; it is not
-  retroactive.
+  `encode_register` yourself. Feed every session the same `on_drain` and `on_disconnected`
+  events. A session created while a connection is already live needs `on_welcome(<live conn>)`
+  from you; it is not retroactive.
+- **Serialize frames and route replies by frame order.** A `Session` assumes it is the only
+  controller on its connection: it keeps one frame in flight, and replies (`registered`,
+  `unregistered`, a whole-frame `error`) are not matched by name, so any reply it is given answers
+  its outstanding frame, and a `registered` that does not list its service makes it re-send. Send
+  one session's `register`/`unregister` only once the previous frame on the connection is
+  answered, and pass each reply only to the session whose frame it answers. `disable`, `enable`
+  and `conflict` carry an id and name and can go to every session.
 - **Handle a session's close commands per service.** `Command::Fatal` and
   `Command::CloseGraceful` mean "close the client" for a single-service agent. On a shared
   client, treat them as the end of that one service: drop or reset its session and stop routing
@@ -248,6 +260,12 @@ How a desktop host that exposes several local MCP servers should use the mcpwarp
   while its child restarts, `Registered` for the rest, and `serve_stream` answers that host's
   `503` before reading the body. Answer your own `503` from the handler only when you need a
   `Retry-After` header; `bridge::target_reply` tells you a `Target` found its child down.
+- **An unknown `Host` is `Registered`, answered `404` by the handler.** Do not return
+  `Unavailable` for a host you do not serve: a `503` claims the service exists. The SDK never
+  routes by `Host` or by `X-Mcpwarp-Server-Id` (single-service profile), so the handler's
+  dispatcher answers `404` for a host it has no child for.
+- **`describe_service_status_raw(state, code, locale)`** gives one service's label and detail
+  (§6A.9) for a list of services; `describe_status` stays the connection's line.
 - **Features: keep the defaults** (`target`, `rustls-platform-verifier`, `ring`). Do not enable
   `aws-lc-rs`. The SDK always passes an explicit rustls provider, so an `aws-lc-rs` that arrives
   through another dependency (common in Tauri) coexists with `ring` without the process-default
@@ -257,9 +275,10 @@ How a desktop host that exposes several local MCP servers should use the mcpwarp
 ## Releasing
 
 The two crates are versioned and tagged separately, with the crate name in the tag:
-`ws-mixer-v0.2.0` and `ws-mixer-mcpwarp-v0.1.0`. ws-mixer-mcpwarp depends on
-`ws-mixer = { path = "..", version = "0.2" }`, so ws-mixer goes first, and ws-mixer-mcpwarp's
-own `cargo publish --dry-run` resolves `ws-mixer` from crates.io and fails until 0.2.0 is there.
+`ws-mixer-v0.2.1` and `ws-mixer-mcpwarp-v0.1.1` (the earlier `ws-mixer-v0.2.0` and
+`ws-mixer-mcpwarp-v0.1.0` tags were never published). ws-mixer-mcpwarp depends on
+`ws-mixer = { path = "..", version = "0.2.1" }`, so ws-mixer goes first, and ws-mixer-mcpwarp's
+own `cargo publish --dry-run` resolves `ws-mixer` from crates.io and fails until 0.2.1 is there.
 
 From a clean `main` with CI green:
 
@@ -274,27 +293,27 @@ cargo deny check
 # 2. ws-mixer
 cargo publish --dry-run -p ws-mixer
 cargo publish -p ws-mixer
-git tag -a ws-mixer-v0.2.0 -m "ws-mixer 0.2.0"
+git tag -a ws-mixer-v0.2.1 -m "ws-mixer 0.2.1"
 
-# 3. ws-mixer-mcpwarp: step 2's ws-mixer 0.2.0 must be in the crates.io index first
+# 3. ws-mixer-mcpwarp: step 2's ws-mixer 0.2.1 must be in the crates.io index first
 #    (step 2's `cargo publish` waits for that before it returns)
 cargo publish --dry-run -p ws-mixer-mcpwarp
 cargo publish -p ws-mixer-mcpwarp
-git tag -a ws-mixer-mcpwarp-v0.1.0 -m "ws-mixer-mcpwarp 0.1.0"
+git tag -a ws-mixer-mcpwarp-v0.1.1 -m "ws-mixer-mcpwarp 0.1.1"
 
-git push origin ws-mixer-v0.2.0 ws-mixer-mcpwarp-v0.1.0
+git push origin ws-mixer-v0.2.1 ws-mixer-mcpwarp-v0.1.1
 ```
 
 Before step 2, `cargo publish --dry-run --workspace` (cargo 1.90+) packages both crates and
 verifies ws-mixer-mcpwarp against the packaged ws-mixer, without crates.io. Cargo treats that
-packaged ws-mixer 0.2.0 like any registry crate, keyed by name and version, so an earlier
-dry-run's extraction (`~/.cargo/registry/src/*/ws-mixer-0.2.0`) and build are reused after the
+packaged ws-mixer 0.2.1 like any registry crate, keyed by name and version, so an earlier
+dry-run's extraction (`~/.cargo/registry/src/*/ws-mixer-0.2.1`) and build are reused after the
 source changed; the symptom is a ws-mixer API reported missing. Delete that directory and run
 with a fresh `CARGO_TARGET_DIR`.
 
 ws-mixer-mcpwarp's package leaves out `tests/` (the fixture runners need the spec checkout), so
-cargo prints one "ignoring test" warning per test target. Move each crate's `[Unreleased]`
-CHANGELOG heading to the version and date in the release commit.
+cargo prints one "ignoring test" warning per test target. Replace each crate's `(unreleased)`
+CHANGELOG heading suffix with the release date in the release commit.
 
 ## License
 

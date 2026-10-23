@@ -50,14 +50,14 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "io-util"] }
 tower-service = "0.3"
 tracing = "0.1"
-ws-mixer = { path = "..", version = "0.2", default-features = false }
+ws-mixer = { path = "..", version = "0.2.1", default-features = false }
 
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "test-util"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tracing-subscriber = "0.3"
-ws-mixer = { path = "..", version = "0.2", default-features = false, features = ["test-util"] }
+ws-mixer = { path = "..", version = "0.2.1", default-features = false, features = ["test-util"] }
 
 [package.metadata.docs.rs]
 all-features = true

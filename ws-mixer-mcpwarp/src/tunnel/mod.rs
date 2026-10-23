@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
-use ws_mixer::{ReconnectPolicy, TlsConfig};
+use ws_mixer::{ReconnectPolicy, TlsConfig, Token};
 
 use crate::bridge::Handler;
 use crate::error::ConfigError;
@@ -43,11 +43,13 @@ pub const DEFAULT_DISPOSE_TIMEOUT: Duration = Duration::from_millis(5000);
 /// (MCPWARP.md §6.2).
 ///
 /// Disabled, or a token that trims to empty, is `off` without dialing,
-/// whatever the other fields hold. Enabled with a token, a `None` token or
-/// name is state `error`, code `INVALID_CONFIG`. The name's syntax is checked
-/// when the connection starts (`error`/`INVALID_NAME`).
+/// whatever the other fields hold. Enabled with neither a token nor a
+/// [`token_provider`](Self::token_provider), or with a `None` name, is state
+/// `error`, code `INVALID_CONFIG`. The name's syntax is checked when the
+/// connection starts (`error`/`INVALID_NAME`).
 ///
-/// `Debug` never prints the token.
+/// `Debug` never prints the token. Equality compares a provider by identity
+/// (the same `Arc`).
 ///
 /// ```
 /// use ws_mixer_mcpwarp::TunnelConfig;
@@ -58,7 +60,7 @@ pub const DEFAULT_DISPOSE_TIMEOUT: Duration = Duration::from_millis(5000);
 /// assert!(!format!("{config:?}").contains("mcpwarp_pat_x"));
 /// # Ok::<(), serde_json::Error>(())
 /// ```
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TunnelConfig {
     /// Whether the tunnel should be online.
@@ -66,6 +68,35 @@ pub struct TunnelConfig {
     /// The token (a PAT or connect-audience JWT); sent trimmed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// A token provider, used instead of [`token`](Self::token) when set
+    /// (MCPWARP.md §6.2 Token provider). It is called on every dial, never
+    /// cached. A rejected token before `welcome` gets one immediate refresh
+    /// and redial (`on_retry` reason `"token-refresh"`); a second rejection
+    /// is `error`/`UNAUTHORIZED`. [`TokenError::Unavailable`] is a failed
+    /// dial, retried with backoff; [`TokenError::Fatal`] is
+    /// `error`/`DISCONNECTED_FATAL`. A [`Token::Static`] here acts as
+    /// `token` would. Never serialized.
+    ///
+    /// ```
+    /// use ws_mixer::{Token, TokenError};
+    /// use ws_mixer_mcpwarp::TunnelConfig;
+    ///
+    /// let config = TunnelConfig {
+    ///     enabled: true,
+    ///     token_provider: Some(Token::provider(|| async {
+    ///         std::env::var("MCPWARP_TOKEN").map_err(TokenError::fatal)
+    ///     })),
+    ///     name: Some("notes".into()),
+    ///     ..TunnelConfig::default()
+    /// };
+    /// // The same provider is the same config; another one is not.
+    /// assert_eq!(config, config.clone());
+    /// ```
+    ///
+    /// [`TokenError::Unavailable`]: ws_mixer::TokenError::Unavailable
+    /// [`TokenError::Fatal`]: ws_mixer::TokenError::Fatal
+    #[serde(skip)]
+    pub token_provider: Option<Token>,
     /// The service name ([`is_valid_service_name`](crate::is_valid_service_name)).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -84,12 +115,32 @@ impl fmt::Debug for TunnelConfig {
         f.debug_struct("TunnelConfig")
             .field("enabled", &self.enabled)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("token_provider", &self.token_provider)
             .field("name", &self.name)
             .field("url", &self.url)
             .field("kind", &self.kind)
             .finish()
     }
 }
+
+impl PartialEq for TunnelConfig {
+    fn eq(&self, other: &Self) -> bool {
+        let same_token = match (&self.token_provider, &other.token_provider) {
+            (None, None) => true,
+            (Some(Token::Static(a)), Some(Token::Static(b))) => a == b,
+            (Some(Token::Provider(a)), Some(Token::Provider(b))) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        same_token
+            && self.enabled == other.enabled
+            && self.token == other.token
+            && self.name == other.name
+            && self.url == other.url
+            && self.kind == other.kind
+    }
+}
+
+impl Eq for TunnelConfig {}
 
 type OnRetry = dyn Fn(&RetryInfo) + Send + Sync;
 type ConnectorFactory = Arc<dyn Fn() -> Box<dyn Connector> + Send + Sync>;
@@ -362,7 +413,8 @@ impl Tunnel {
     /// The call is queued when it is made, before the returned future is
     /// polled: calls take effect in call order and only the last of several
     /// back-to-back calls dials. Equal to the last config (same `enabled`,
-    /// trimmed token, name, url and kind) is a no-op unless a `stop`, a
+    /// trimmed token or the same provider `Arc`, name, url and kind) is a
+    /// no-op unless a `stop`, a
     /// conflict or an error came in between. Otherwise the current
     /// connection is stopped (unregister, up to 2 s, then the client's
     /// drain, up to 5 s more) and, when enabled with a token, a new one

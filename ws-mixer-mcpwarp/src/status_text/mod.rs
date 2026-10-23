@@ -17,6 +17,10 @@ pub const STATUS_LOCALES: &[&str] = &["en", "de", "es", "fr", "ja", "zh-CN"];
 /// `lastError` of `INVALID_CONFIG` that adds nothing to the sentence.
 const GENERIC_INVALID: &str = crate::last_error::INVALID_CONFIG;
 
+/// A service group's `error`/`INTERNAL` `lastError` when its first reply
+/// registered nothing (MCPWARP.md §6A.9).
+const NO_SERVICE_REGISTERED: &str = "No service could be registered.";
+
 /// Options for [`describe_status`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DescribeOptions {
@@ -54,7 +58,8 @@ pub struct StatusText {
 ///
 /// `label` is the state; `detail` the code's sentence, for `INVALID_CONFIG`
 /// followed by a per-locale colon and `last_error`, or `last_error` itself
-/// when there is no code.
+/// when there is no code. `error`/`INTERNAL` with a service group's
+/// `"No service could be registered."` shows its own sentence (§6A.9).
 ///
 /// ```
 /// use ws_mixer_mcpwarp::{
@@ -122,6 +127,9 @@ pub fn describe_status_raw(
     });
     let detail = match (sentence, last_error) {
         (None, le) => le.map(str::to_owned),
+        (Some(_), Some(NO_SERVICE_REGISTERED)) if state == "error" && code == Some("INTERNAL") => {
+            Some(table.no_service_registered.to_owned())
+        }
         (Some(s), Some(le)) if code == Some("INVALID_CONFIG") && !le.is_empty() => {
             Some(invalid_config_detail(s, le, table.joiner))
         }
@@ -129,6 +137,49 @@ pub fn describe_status_raw(
     };
     StatusText {
         detail: detail.filter(|d| !d.is_empty() && d != label),
+        label: label.to_owned(),
+    }
+}
+
+/// `describeServiceStatus` (MCPWARP.md §6A.9): one service of a service
+/// group as UI text, over wire strings. `locale` resolves as in
+/// [`DescribeOptions::locale`]; there are no overrides.
+///
+/// `label` is the `service.<state>` label, an unknown state its own label.
+/// `detail` is set only for `rejected` (the sentence for its register error
+/// code) and for `disabled` with code `DISABLED` (the dashboard sentence);
+/// a service's `lastError` is never shown.
+///
+/// The spec-shaped `describe_service_status(&ServiceStatus, &DescribeOptions)`
+/// (§9.2) is reserved for a future multi-service controller.
+///
+/// ```
+/// use ws_mixer_mcpwarp::describe_service_status_raw;
+///
+/// let text = describe_service_status_raw("rejected", Some("FORBIDDEN"), Some("de"));
+/// assert_eq!(text.label, "Abgelehnt");
+/// assert_eq!(text.detail.as_deref(), Some("Zugriffstoken wurde abgelehnt"));
+///
+/// assert_eq!(describe_service_status_raw("active", None, None).label, "Active");
+/// ```
+pub fn describe_service_status_raw(
+    state: &str,
+    code: Option<&str>,
+    locale: Option<&str>,
+) -> StatusText {
+    let table = resolve_locale(locale);
+    let label = table.service(state).unwrap_or(state);
+    let detail = match (state, code) {
+        ("rejected", code) => table.code(match code.unwrap_or_default() {
+            c @ ("INVALID_NAME" | "USERNAME_REQUIRED" | "QUOTA_EXCEEDED" | "CONFLICT") => c,
+            "UNAUTHENTICATED" | "FORBIDDEN" => "UNAUTHORIZED",
+            _ => "INTERNAL",
+        }),
+        ("disabled", Some("DISABLED")) => table.state("disabled"),
+        _ => None,
+    };
+    StatusText {
+        detail: detail.filter(|d| *d != label).map(str::to_owned),
         label: label.to_owned(),
     }
 }
@@ -527,6 +578,49 @@ mod tests {
             raw("error", Some("CONFLICT"), Some("x"), &o),
             (String::new(), None)
         );
+    }
+
+    #[test]
+    fn no_service_registered_only_on_error_internal() {
+        let en = DescribeOptions::default();
+        let le = Some(NO_SERVICE_REGISTERED);
+        assert_eq!(
+            raw("error", Some("INTERNAL"), le, &opts("fr")).1.as_deref(),
+            Some("Aucun service n'a pu être enregistré")
+        );
+        assert_eq!(
+            raw("connecting", Some("INTERNAL"), le, &en).1.as_deref(),
+            Some("Unexpected error")
+        );
+        assert_eq!(
+            raw(
+                "error",
+                Some("INTERNAL"),
+                Some("No service could be registered"),
+                &en
+            )
+            .1
+            .as_deref(),
+            Some("Unexpected error")
+        );
+        assert_eq!(raw("error", None, le, &en).1.as_deref(), le);
+    }
+
+    #[test]
+    fn service_status_details() {
+        let d = |state, code| describe_service_status_raw(state, code, None).detail;
+        assert_eq!(d("rejected", None).as_deref(), Some("Unexpected error"));
+        assert_eq!(
+            d("rejected", Some("UNAUTHENTICATED")).as_deref(),
+            Some("Access token was rejected")
+        );
+        assert_eq!(
+            d("rejected", Some("conflict")).as_deref(),
+            Some("Unexpected error")
+        );
+        assert_eq!(d("disabled", Some("TAKEN_OVER")), None);
+        assert_eq!(d("active", Some("CONFLICT")), None);
+        assert_eq!(d("paused", Some("DISABLED")), None);
     }
 
     #[test]

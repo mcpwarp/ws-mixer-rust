@@ -5,18 +5,36 @@ All notable changes to `ws-mixer` (the Rust client SDK for ws-mixer.v1) are docu
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## 0.2.1 (unreleased)
 
-0.2.0 will be published from main after this pin bump; the `ws-mixer-v0.2.0` tag predates it.
+The first release published to crates.io: 0.2.0 was tagged (`ws-mixer-v0.2.0`) but never
+published. Implements the client role of ws-mixer spec v0.7.2; conformance 25/25 client fixtures
+(including the new `window_stale_retired_stream` sequence) and 10/10 pair scenarios against
+ws-mixer-go v0.9.0.
 
 ### Changed
 
-- After the `ws-mixer-v0.2.0` tag the pins moved on to spec v0.6.2 and ws-mixer-go v0.9.0, with
-  the same results (24/24, 10/10) and no code change.
+- Pins spec v0.7.2 and ws-mixer-go v0.9.0 (after the 0.2.0 tag they had moved to spec v0.6.2
+  and go v0.9.0 with no code change).
+- Control messages accept any JSON number whose value is integral as that integer in every
+  integer field (`"v": 1.0` and `1e0` are `1`, WIRE.md §2.7 Integer fields), then apply the
+  field's range check. A number with a fraction (`1.5`) or a boolean is still rejected with
+  `PROTOCOL_ERROR` ("must be an integer, got non-integer number 1.5"). A number written with an
+  exponent or beyond `u64` is judged on its `f64` value (rounded beyond 2^53).
+- Error wording: an integral number outside a field's range is now reported as
+  `<t>.<field> <n> out of range <min>..=<max>` (e.g. `welcome.window 10000000000 out of range`,
+  `welcome.max_streams 1e+300 out of range`) instead of "must be an integer, got non-integer
+  number ..."; a float `v` that is integral but not 1 (`7e0`, `1e300`) is `UNSUPPORTED`
+  ("welcome.v 7 is not supported ...") instead of `PROTOCOL_ERROR`.
+- The first rejected token with a `Token::Provider` (HTTP 401 at the upgrade, or close 4011
+  before `welcome`) is now reported as a non-fatal `Event::Disconnected` (`retry_in` zero), then
+  `Event::Redial { cause: TokenRefresh, attempt: 1, delay: 0 }`, then the redial (CLIENT-SDK.md
+  Rejected token row, MCPWARP.md §11 row 53). Before, only the `Redial` was emitted. A second
+  rejection, and the first with a static token, stay fatal.
 
-## 0.2.0 (tagged `ws-mixer-v0.2.0`, not yet published)
+## 0.2.0 (tagged `ws-mixer-v0.2.0`, never published)
 
-The first release to be published. Implements the client role of ws-mixer spec v0.6.1;
+Implements the client role of ws-mixer spec v0.6.1;
 conformance 24/24 client fixtures and 10/10 pair scenarios against ws-mixer-go v0.8.0.
 
 ### Added

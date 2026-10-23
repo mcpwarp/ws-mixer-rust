@@ -496,7 +496,7 @@ fn disable_matching_id_and_enable_reregisters() {
     assert_eq!(h.s.state(), ExposeState::Registered);
     h.app(json!({"op": "disable", "id": "srv_anki", "reason": "disabled"}));
     assert_eq!(h.s.state(), ExposeState::Disabled);
-    h.app(json!({"op": "enable", "id": "srv_anki", "name": "other"}));
+    h.app(json!({"op": "enable", "id": "srv_other", "name": "other"}));
     assert_eq!(h.s.state(), ExposeState::Disabled);
     h.app(json!({"op": "enable", "id": "srv_new", "name": "anki"}));
     assert_eq!(h.enabled(), ["srv_new"]);
@@ -585,10 +585,47 @@ fn a_matching_enable_drops_a_held_disable() {
     h.app(json!({"op": "disable", "id": "srv_anki"}));
     h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
     assert_eq!(h.s.state(), ExposeState::Registering);
-    assert_eq!(h.ops(), ["register", "register"]);
+    // Queued behind the outstanding register (one in flight).
+    assert_eq!(h.ops(), ["register"]);
     h.registered(false);
     assert_eq!(h.s.state(), ExposeState::Registered);
     assert!(h.disabled().is_empty());
+    assert_eq!(h.ops(), ["register", "register"]);
+}
+
+#[test]
+fn an_enable_matching_only_the_server_id_is_ours() {
+    // §2.7: `name` or `id`, e.g. after a rename.
+    let mut h = H::new();
+    h.welcome(1);
+    h.registered(false);
+    h.app(json!({"op": "disable", "id": "srv_anki"}));
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "renamed"}));
+    assert_eq!(h.enabled(), ["srv_anki"]);
+    assert_eq!(h.s.state(), ExposeState::Registering);
+    assert_eq!(h.ops(), ["register", "register"]);
+}
+
+#[test]
+fn an_enable_for_the_held_disables_id_clears_the_hold() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "disable", "id": "srv_anki", "reason": "maintenance"}));
+    // Neither our name nor a known id: not ours, but it ends the hold.
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "other"}));
+    assert!(h.enabled().is_empty());
+    assert_eq!(h.ops(), ["register"]);
+    h.registered(true);
+    assert_eq!(h.s.state(), ExposeState::Registered);
+    assert!(h.disabled().is_empty());
+
+    // An enable for some other id keeps the hold.
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "disable", "id": "srv_anki", "reason": "maintenance"}));
+    h.app(json!({"op": "enable", "id": "srv_x", "name": "other"}));
+    h.registered(true);
+    assert_eq!(h.s.state(), ExposeState::Disabled);
 }
 
 #[test]
@@ -606,18 +643,16 @@ fn server_disabled_drops_a_held_disable_with_one_disabled_event() {
 }
 
 #[test]
-fn a_held_disable_survives_a_drain_hand_over() {
+fn a_held_disable_is_dropped_by_the_drain_replacements_welcome() {
     let mut h = H::new();
     h.welcome(1);
     h.app(json!({"op": "disable", "id": "srv_anki", "reason": "maintenance"}));
     assert!(!h.drain(1, DrainReason::Rollout));
     h.welcome(2);
     h.registered(true);
-    assert_eq!(h.s.state(), ExposeState::Disabled);
-    assert_eq!(
-        h.disabled(),
-        [(Some("srv_anki".into()), "maintenance".into())]
-    );
+    // The hold belonged to connection 1 (§2.7 Held `disable` lifetime).
+    assert_eq!(h.s.state(), ExposeState::Registered);
+    assert!(h.disabled().is_empty());
 }
 
 #[test]
@@ -661,29 +696,252 @@ fn overloaded_resends_the_outstanding_register_once_after_1s() {
     assert_eq!(h.ops(), ["register", "register"], "nothing outstanding");
 }
 
+/// `OVERLOADED`, then the time until the re-send went out.
+fn overloaded_resend_after(h: &mut H) -> u128 {
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    let (before, start) = (h.sent.len(), h.now);
+    while h.sent.len() == before {
+        h.advance(MS * 100);
+    }
+    (h.now - start).as_millis()
+}
+
 #[test]
 fn overloaded_attempt_counts_consecutive_resends_and_resets_on_success() {
     let mut h = H::new();
     h.welcome(1);
-    let overloaded = |h: &mut H| {
-        h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
-        h.advance(MS * 1000);
-    };
-    overloaded(&mut h);
-    overloaded(&mut h);
-    overloaded(&mut h);
+    let delays: Vec<_> = (0..3).map(|_| overloaded_resend_after(&mut h)).collect();
+    assert_eq!(delays, [1000, 2000, 4000]);
     h.registered(false);
     h.app(json!({"op": "disable", "id": "srv_anki"}));
     h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
-    overloaded(&mut h);
+    assert_eq!(overloaded_resend_after(&mut h), 1000);
     assert_eq!(
         h.retries()
             .iter()
-            .map(|(r, _)| r.attempt)
+            .map(|(r, _)| (r.attempt, r.delay.as_millis()))
             .collect::<Vec<_>>(),
-        [1, 2, 3, 1]
+        [(1, 1000), (2, 2000), (3, 4000), (1, 1000)]
     );
     assert_eq!(h.ops().len(), 6);
+}
+
+#[test]
+fn overloaded_backoff_caps_at_30s() {
+    let mut h = H::new();
+    h.welcome(1);
+    let delays: Vec<_> = (0..7).map(|_| overloaded_resend_after(&mut h)).collect();
+    assert_eq!(delays, [1000, 2000, 4000, 8000, 16000, 30000, 30000]);
+}
+
+#[test]
+fn overloaded_counter_resets_on_an_error_entry_and_a_whole_frame_error() {
+    // A transient error entry: its own backoff (1 s), and the next
+    // OVERLOADED starts over at 1 s (fixture tunnel/26_t16).
+    let mut h = H::new();
+    h.welcome(1);
+    assert_eq!(overloaded_resend_after(&mut h), 1000);
+    assert_eq!(overloaded_resend_after(&mut h), 2000);
+    h.reg_error("INTERNAL", json!({}));
+    h.advance(MS * 1000);
+    assert_eq!(h.ops().len(), 4);
+    assert_eq!(overloaded_resend_after(&mut h), 1000);
+
+    // A whole-frame error op answers the frame and resets it too.
+    let mut h = H::new();
+    h.welcome(1);
+    assert_eq!(overloaded_resend_after(&mut h), 1000);
+    assert_eq!(overloaded_resend_after(&mut h), 2000);
+    h.app(json!({"op": "error", "code": "BAD_REQUEST"}));
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    assert_eq!(overloaded_resend_after(&mut h), 1000);
+}
+
+#[test]
+fn overloaded_counter_resets_on_a_new_connections_welcome() {
+    let mut h = H::new();
+    h.welcome(1);
+    assert_eq!(overloaded_resend_after(&mut h), 1000);
+    assert_eq!(overloaded_resend_after(&mut h), 2000);
+    h.disconnect(1);
+    h.welcome(2);
+    assert_eq!(overloaded_resend_after(&mut h), 1000);
+}
+
+// --- one frame in flight (§2.6, §3.2) --------------------------------------------
+
+#[test]
+fn an_enable_during_an_overloaded_pause_sends_no_second_frame_and_success_stops_the_resend() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    assert_eq!(h.ops(), ["register"], "folded into the scheduled re-send");
+    h.registered(false);
+    assert!(h.timers.is_empty(), "the OVERLOADED re-send is cancelled");
+    // The enable's register goes out after the reply, alone.
+    assert_eq!(h.ops(), ["register", "register"]);
+    h.advance(MS * 60_000);
+    assert_eq!(h.ops(), ["register", "register"]);
+}
+
+#[test]
+fn an_enable_while_a_register_is_outstanding_waits_for_the_reply() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.registered(false);
+    h.app(json!({"op": "disable", "id": "srv_anki"}));
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    assert_eq!(h.ops(), ["register", "register"]);
+    h.registered(false);
+    assert_eq!(h.ops(), ["register", "register", "register"]);
+    h.registered(false);
+    assert_eq!(h.ops().len(), 3, "one queued trigger, one register");
+}
+
+#[test]
+fn an_enable_during_a_transient_retry_sends_at_once_and_cancels_the_retry() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.reg_error("INTERNAL", json!({}));
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    assert_eq!(h.ops(), ["register", "register"]);
+    assert!(h.timers.is_empty());
+    h.advance(MS * 60_000);
+    assert_eq!(h.ops().len(), 2);
+}
+
+#[test]
+fn a_whole_frame_error_answers_the_outstanding_register() {
+    for code in ["TOO_MANY_SERVICES", "SOMETHING_NEW"] {
+        let mut h = H::new();
+        h.welcome(1);
+        h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+        h.advance(MS * 1000);
+        assert_eq!(h.ops(), ["register", "register"], "{code}: re-sent");
+        h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+        assert_eq!(h.ops().len(), 2, "{code}: queued behind the re-send");
+        h.app(json!({"op": "error", "code": code}));
+        assert_eq!(h.errors(), [(code.to_owned(), ErrorOrigin::App)]);
+        // The slot is freed; the queued trigger goes out.
+        assert!(h.timers.is_empty(), "{code}");
+        assert_eq!(h.ops().len(), 3, "{code}");
+        // The slot is free again after the next reply.
+        h.registered(false);
+        h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+        assert_eq!(h.ops().len(), 4, "{code}");
+    }
+}
+
+#[test]
+fn an_error_op_during_an_overloaded_pause_answers_nothing() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.app(json!({"op": "error", "code": "UNKNOWN_OP"}));
+    assert_eq!(h.errors(), [("UNKNOWN_OP".to_owned(), ErrorOrigin::App)]);
+    assert_eq!(h.timers.len(), 1, "the re-send is still scheduled");
+    h.advance(MS * 999);
+    assert_eq!(h.ops(), ["register"]);
+    h.advance(MS);
+    assert_eq!(h.ops(), ["register", "register"]);
+
+    // UNSUPPORTED_VERSION stays fatal.
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.app(json!({"op": "error", "code": "UNSUPPORTED_VERSION"}));
+    assert_eq!(h.closed, [Closed::Fatal("UNSUPPORTED_VERSION".into())]);
+}
+
+#[test]
+fn an_empty_registered_during_an_overloaded_pause_answers_nothing() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.app(json!({"op": "registered"}));
+    assert_eq!(
+        h.retries().iter().map(|(_, k)| *k).collect::<Vec<_>>(),
+        [RegisterRetryKind::Overloaded]
+    );
+    assert_eq!(h.timers.len(), 1, "the re-send is still scheduled");
+    assert_eq!(h.s.state(), ExposeState::Registering);
+    h.advance(MS * 999);
+    assert_eq!(h.ops(), ["register"]);
+    h.advance(MS);
+    assert_eq!(h.ops(), ["register", "register"]);
+}
+
+#[test]
+fn a_registered_with_nothing_outstanding_settles_the_handle() {
+    // §3.2 One controller per connection: one name, accepted by name.
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "error", "code": "UNKNOWN_OP"}));
+    h.registered(true);
+    assert_eq!(h.s.state(), ExposeState::Registered);
+    assert_eq!(h.registrations().len(), 1);
+    assert_eq!(h.s.url(), Some("https://anki-u.x/mcp"));
+    assert_eq!(h.ops(), ["register"]);
+}
+
+#[test]
+fn connection_limit_does_not_answer_the_frame() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "error", "code": "CONNECTION_LIMIT"}));
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    assert_eq!(h.ops(), ["register"], "still outstanding");
+}
+
+#[test]
+fn a_late_error_from_an_ended_connection_does_not_settle_the_new_frame() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.disconnect(1);
+    h.welcome(2);
+    h.app_on(1, json!({"op": "error", "code": "UNKNOWN_OP"}));
+    assert_eq!(h.errors(), [("UNKNOWN_OP".to_owned(), ErrorOrigin::App)]);
+    h.app_on(1, json!({"op": "error", "code": "OVERLOADED"}));
+    assert!(h.timers.is_empty() && h.retries().is_empty());
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    assert_eq!(
+        h.ops(),
+        ["register", "register"],
+        "register 2 is outstanding"
+    );
+}
+
+#[test]
+fn a_registered_listing_none_of_the_names_is_answered_by_a_transient_resend() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "registered"}));
+    assert_eq!(h.s.state(), ExposeState::Registering);
+    assert!(h.errors().is_empty() && h.registrations().is_empty());
+    assert_eq!(
+        h.retries(),
+        [(
+            RetryInfo {
+                attempt: 1,
+                delay: MS * 1000,
+                reason: "register failed: registered reply did not list the service".into()
+            },
+            RegisterRetryKind::Transient
+        )]
+    );
+    h.advance(MS * 1000);
+    assert_eq!(h.ops(), ["register", "register"]);
+    // The transient counter carries on.
+    h.app(json!({"op": "registered", "services": [], "errors": []}));
+    assert_eq!(h.retries()[1].0.delay, MS * 2000);
+    // With nothing outstanding it is ignored.
+    h.advance(MS * 2000);
+    h.registered(false);
+    h.app(json!({"op": "registered"}));
+    assert_eq!(h.retries().len(), 2);
+    assert_eq!(h.s.state(), ExposeState::Registered);
 }
 
 #[test]
@@ -753,14 +1011,16 @@ fn a_fatal_while_closing_changes_nothing() {
     assert_eq!(h.closed, [Closed::Fatal("UNSUPPORTED_VERSION".into())]);
     assert_eq!(h.fatals.len(), 1);
 
-    // During a user close (unregister wait): the close stays error-free.
+    // During a user close (unregister wait): the close stays error-free; the
+    // error answers the unregister, ending the wait.
     let mut h = H::new();
     h.welcome(1);
     h.registered(true);
     h.close();
     assert_eq!(h.s.state(), ExposeState::Closing);
     h.app(json!({"op": "error", "code": "UNSUPPORTED_VERSION"}));
-    assert!(h.fatals.is_empty() && h.closed.is_empty());
+    assert!(h.fatals.is_empty());
+    assert_eq!(h.closed, [Closed::Graceful]);
     assert_eq!(h.s.state(), ExposeState::Closing);
 }
 
@@ -886,6 +1146,98 @@ fn overloaded_unregister_is_resent_once_while_closing() {
 }
 
 #[test]
+fn a_disconnect_during_a_paused_unregister_resend_sends_nothing() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.registered(false);
+    h.close();
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.disconnect(1);
+    h.advance(MS * 1500);
+    assert_eq!(h.ops(), ["register", "unregister"]);
+    h.advance(MS * 500);
+    assert_eq!(h.closed, [Closed::Graceful]);
+}
+
+#[test]
+fn a_replacement_welcomed_during_a_paused_unregister_resend_gets_nothing() {
+    // §3.2: no register went out on the replacement, so no unregister.
+    let mut h = H::new();
+    h.welcome(1);
+    h.registered(false);
+    h.close();
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.drain(1, DrainReason::Rollout);
+    h.welcome(2);
+    h.advance(MS * 1500);
+    assert_eq!(h.ops(), ["register", "unregister"]);
+    h.advance(MS * 500);
+    assert_eq!(h.closed, [Closed::Graceful]);
+}
+
+#[test]
+fn the_unregister_budget_cancels_a_resend_paused_past_it() {
+    // n = 3 at close, 4 for the unregister's OVERLOADED: its pause is
+    // 8000 ms, past the 2000 ms budget (§3.2 Unregister).
+    let mut h = H::new();
+    h.welcome(1);
+    h.registered(false);
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    assert_eq!(overloaded_resend_after(&mut h), 1000);
+    assert_eq!(overloaded_resend_after(&mut h), 2000);
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.close();
+    let at_close = h.ops().len();
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.advance(MS * 2000);
+    assert_eq!(h.closed, [Closed::Graceful]);
+    assert!(h.timers.is_empty());
+    h.advance(MS * 10_000);
+    assert_eq!(
+        h.ops().len(),
+        at_close,
+        "no unregister re-send after the budget"
+    );
+}
+
+#[test]
+fn overloaded_dropping_the_register_ahead_counts_so_the_unregister_pause_is_2000ms() {
+    // §2.6: n counts every consecutive OVERLOADED on the connection, this one
+    // included; the first dropped the register ahead (n = 1), the second the
+    // unregister (n = 2: min(1000 * 2^1, 30000) = 2000 ms).
+    let mut h = H::new();
+    h.welcome(1);
+    h.close();
+    assert_eq!(h.ops(), ["register", "unregister"]);
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    let pause = h
+        .timers
+        .iter()
+        .find(|(t, _)| t.kind() == TimerKind::Overload)
+        .map(|(_, at)| *at - h.now);
+    assert_eq!(pause, Some(MS * 2000));
+}
+
+#[test]
+fn an_error_op_during_a_paused_unregister_does_not_end_the_close_wait() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.registered(false);
+    h.close();
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.app(json!({"op": "error", "code": "UNKNOWN_OP"}));
+    assert_eq!(h.errors(), [("UNKNOWN_OP".to_owned(), ErrorOrigin::App)]);
+    assert!(h.closed.is_empty());
+    h.advance(MS * 999);
+    assert_eq!(h.ops(), ["register", "unregister"]);
+    h.advance(MS);
+    assert_eq!(h.ops(), ["register", "unregister", "unregister"]);
+    h.app(json!({"op": "unregistered"}));
+    assert_eq!(h.closed, [Closed::Graceful]);
+}
+
+#[test]
 fn conflict_for_our_name_or_id_is_sticky() {
     let mut h = H::new();
     h.welcome(1);
@@ -977,8 +1329,143 @@ fn nothing_is_accepted_while_closing_except_unregistered_and_errors() {
     assert_eq!(h.s.state(), ExposeState::Closing);
     assert_eq!(h.registrations().len(), 1);
     assert!(h.disabled().is_empty() && h.enabled().is_empty() && h.conflicts().is_empty());
+    assert!(h.closed.is_empty(), "registered does not end the wait");
     h.app(json!({"op": "error", "code": "UNKNOWN_OP"}));
     assert_eq!(h.errors(), [("UNKNOWN_OP".to_owned(), ErrorOrigin::App)]);
+    // Nothing ahead of the unregister: the error answers it.
+    assert_eq!(h.closed, [Closed::Graceful]);
+    assert!(h.timers.is_empty());
+}
+
+#[test]
+fn close_wait_follows_frame_order_when_a_register_is_still_ahead() {
+    // An error op answers the register first; the next one the unregister.
+    let mut h = H::new();
+    h.welcome(1);
+    h.close();
+    assert_eq!(h.ops(), ["register", "unregister"]);
+    h.app(json!({"op": "error", "code": "TOO_MANY_SERVICES"}));
+    assert!(h.closed.is_empty(), "it answered the register");
+    h.app(json!({"op": "error", "code": "SOMETHING_NEW"}));
+    assert_eq!(h.closed, [Closed::Graceful]);
+    assert!(h.timers.is_empty());
+
+    // A registered answers the register; the wait goes on until an error op.
+    let mut h = H::new();
+    h.welcome(1);
+    h.close();
+    h.registered(true);
+    assert!(h.closed.is_empty());
+    assert!(
+        h.registrations().is_empty(),
+        "no registration while closing"
+    );
+    h.app(json!({"op": "error", "code": "UNKNOWN_OP"}));
+    assert_eq!(h.closed, [Closed::Graceful]);
+
+    // Or until unregistered, as before.
+    let mut h = H::new();
+    h.welcome(1);
+    h.close();
+    h.app(json!({"op": "unregistered"}));
+    assert_eq!(h.closed, [Closed::Graceful]);
+
+    // A register only ever dropped by OVERLOADED is not ahead, and there is
+    // nothing to unregister: the close is immediate.
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.close();
+    assert_eq!(h.ops(), ["register"]);
+    assert_eq!(h.closed, [Closed::Graceful]);
+    h.app(json!({"op": "error", "code": "UNKNOWN_OP"}));
+    assert_eq!(h.closed, [Closed::Graceful]);
+
+    // OVERLOADED after close drops the register ahead: abandoned, nothing
+    // re-sent, and the next error answers the unregister.
+    let mut h = H::new();
+    h.welcome(1);
+    h.close();
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    let sent = h.sent.len();
+    h.app(json!({"op": "error", "code": "UNKNOWN_OP"}));
+    assert_eq!(h.closed, [Closed::Graceful]);
+    h.advance(MS * 30_000);
+    assert_eq!(h.sent.len(), sent, "nothing sent after the OVERLOADED");
+    assert_eq!(h.ops(), ["register", "unregister"]);
+}
+
+#[test]
+fn close_skips_the_unregister_when_every_register_was_dropped_by_overloaded() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.close();
+    assert_eq!(h.ops(), ["register"]);
+    assert_eq!(h.closed, [Closed::Graceful]);
+    assert!(h.timers.is_empty(), "no unregister budget");
+
+    // Re-sent and dropped again.
+    let mut h = H::new();
+    h.welcome(1);
+    assert_eq!(overloaded_resend_after(&mut h), 1000);
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.close();
+    assert_eq!(h.ops(), ["register", "register"]);
+    assert_eq!(h.closed, [Closed::Graceful]);
+    assert!(h.timers.is_empty());
+}
+
+#[test]
+fn close_unregisters_after_any_reply_to_a_register() {
+    // A whole-frame error op answered the register.
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "error", "code": "UNKNOWN_OP"}));
+    h.close();
+    assert_eq!(h.ops(), ["register", "unregister"]);
+    assert!(h.closed.is_empty());
+
+    // An empty registered.
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "registered"}));
+    h.close();
+    assert_eq!(h.ops(), ["register", "unregister"]);
+
+    // A registered naming the service during the OVERLOADED pause.
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.registered(true);
+    assert!(h.timers.is_empty(), "the re-send is cancelled");
+    h.close();
+    assert_eq!(h.ops(), ["register", "unregister"]);
+
+    // Registered earlier on this connection, the re-register dropped.
+    let mut h = H::new();
+    h.welcome(1);
+    h.registered(true);
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.close();
+    assert_eq!(h.ops(), ["register", "register", "unregister"]);
+    h.advance(MS * 5000);
+    assert_eq!(
+        h.ops(),
+        ["register", "register", "unregister"],
+        "the dropped register is not re-sent"
+    );
+}
+
+#[test]
+fn a_registered_from_another_connection_before_any_welcome_is_ignored() {
+    let mut h = H::new();
+    h.registered(true);
+    assert_eq!(h.s.state(), ExposeState::Connecting);
+    assert_eq!(h.s.url(), None);
+    assert_eq!(h.s.server_id(), None);
+    assert!(h.registrations().is_empty());
 }
 
 #[test]
@@ -993,6 +1480,53 @@ fn registered_is_accepted_while_disabled_and_resets_backoff() {
     assert_eq!(h.s.state(), ExposeState::Registered);
     h.reg_error("INTERNAL", json!({}));
     assert_eq!(h.retries().last().unwrap().0.delay, MS * 1000);
+}
+
+fn retry_delays(h: &H) -> Vec<u128> {
+    h.retries()
+        .iter()
+        .map(|(r, _)| r.delay.as_millis())
+        .collect()
+}
+
+#[test]
+fn a_non_transient_error_entry_resets_the_transient_backoff() {
+    // §3.2: a SERVER_DISABLED entry is a successful reply for the counter.
+    let mut h = H::new();
+    h.welcome(1);
+    h.reg_error("INTERNAL", json!({}));
+    h.reg_error("INTERNAL", json!({}));
+    h.reg_error("SERVER_DISABLED", json!({"id": "srv_anki"}));
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    h.reg_error("INTERNAL", json!({}));
+    assert_eq!(retry_delays(&h), [1000, 2000, 1000]);
+
+    // So is a refusal on a re-register.
+    let mut h = H::new();
+    h.welcome(1);
+    h.registered(false);
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    h.reg_error("INTERNAL", json!({}));
+    h.advance(MS * 1000);
+    h.reg_error("FORBIDDEN", json!({}));
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    h.reg_error("INTERNAL", json!({}));
+    assert_eq!(h.ops().len(), 4);
+    assert_eq!(retry_delays(&h), [1000, 1000]);
+    assert!(h.fatals.is_empty());
+}
+
+#[test]
+fn a_whole_frame_error_leaves_the_transient_backoff_alone() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.reg_error("INTERNAL", json!({}));
+    h.advance(MS * 1000);
+    h.app(json!({"op": "error", "code": "UNKNOWN_OP"}));
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    h.reg_error("INTERNAL", json!({}));
+    assert_eq!(h.ops().len(), 3);
+    assert_eq!(retry_delays(&h), [1000, 2000]);
 }
 
 // --- §3.2 register on every welcome, incl. a drain replacement --------------------
@@ -1025,8 +1559,8 @@ fn t38_a_superseded_connection_end_changes_nothing_even_while_registering() {
     assert!(h.disconnect(1), "superseded");
     assert_eq!(h.s.state(), ExposeState::Registering);
     assert_eq!(h.ops(), ["register", "register"]);
-    // Its id is forgotten once it ended.
-    assert!(!h.s.is_superseded(c(1)));
+    // Still superseded once it ended: its late ops stay ignored.
+    assert!(h.s.is_superseded(c(1)));
 }
 
 #[test]
@@ -1149,6 +1683,131 @@ fn conflict_stays_conflict_across_disconnects() {
     assert_eq!(h.s.state(), ExposeState::Conflict);
 }
 
+// --- §2.7 Ended connection (T51) -------------------------------------------------
+
+#[test]
+fn t51_registered_disable_enable_after_their_connection_ended_are_ignored() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.registered(true);
+    assert!(!h.disconnect(1));
+    assert_eq!(h.s.state(), ExposeState::Connecting);
+    for env in [
+        json!({"op": "disable", "id": "srv_anki", "reason": "disabled"}),
+        json!({"op": "registered", "services": [{"name": "anki", "id": "srv_anki", "url": "https://old/mcp"}]}),
+        json!({"op": "enable", "id": "srv_anki", "name": "anki"}),
+    ] {
+        h.app_on(1, env);
+    }
+    assert_eq!(h.s.state(), ExposeState::Connecting);
+    assert!(h.disabled().is_empty() && h.enabled().is_empty());
+    assert_eq!(h.registrations().len(), 1);
+    assert_eq!(h.ops(), ["register"]);
+    // The reconnect is unaffected.
+    h.welcome(2);
+    h.registered(false);
+    assert_eq!(h.s.state(), ExposeState::Registered);
+}
+
+#[test]
+fn t51_a_conflict_after_its_connection_ended_still_applies() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.registered(true);
+    assert!(!h.disconnect(1));
+    h.app_on(
+        1,
+        json!({"op": "conflict", "id": "srv_anki", "name": "anki"}),
+    );
+    assert_eq!(h.s.state(), ExposeState::Conflict);
+    assert_eq!(h.conflicts().len(), 1);
+    assert_eq!(
+        h.closed,
+        [Closed::Immediate(TAKEN_OVER_MESSAGE.into())],
+        "no reconnect"
+    );
+    h.welcome(2);
+    assert_eq!(h.ops(), ["register"]);
+}
+
+#[test]
+fn t51_an_error_after_its_connection_ended_still_applies() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.registered(true);
+    assert!(!h.disconnect(1));
+    h.app_on(
+        1,
+        json!({"op": "error", "code": "UNKNOWN_OP", "message": "x"}),
+    );
+    assert_eq!(h.errors(), [("UNKNOWN_OP".to_owned(), ErrorOrigin::App)]);
+    h.app_on(1, json!({"op": "error", "code": "UNSUPPORTED_VERSION"}));
+    assert_eq!(h.closed, [Closed::Fatal("UNSUPPORTED_VERSION".into())]);
+}
+
+#[test]
+fn t51_a_superseded_connection_stays_ignored_after_it_ended() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.registered(false);
+    h.drain(1, DrainReason::Rollout);
+    h.welcome(2);
+    assert!(h.disconnect(1));
+    h.app_on(
+        1,
+        json!({"op": "conflict", "id": "srv_anki", "name": "anki"}),
+    );
+    h.app_on(1, json!({"op": "error", "code": "UNSUPPORTED_VERSION"}));
+    assert_eq!(h.s.state(), ExposeState::Registering);
+    assert!(h.closed.is_empty() && h.conflicts().is_empty());
+}
+
+#[test]
+fn t51_a_drained_connection_ended_before_the_welcome_counts_as_ended() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.registered(false);
+    h.drain(1, DrainReason::Rollout);
+    assert!(!h.disconnect(1), "T44");
+    h.app_on(1, json!({"op": "disable", "id": "srv_anki"}));
+    assert_eq!(h.s.state(), ExposeState::Connecting);
+    h.app_on(
+        1,
+        json!({"op": "conflict", "id": "srv_anki", "name": "anki"}),
+    );
+    assert_eq!(h.s.state(), ExposeState::Conflict);
+}
+
+#[test]
+fn ended_connections_are_remembered_up_to_a_bound() {
+    let mut h = H::new();
+    for n in 1..=(ENDED_MEMORY as u64 + 4) {
+        h.welcome(n);
+        h.disconnect(n);
+    }
+    assert_eq!(h.s.ended.len(), ENDED_MEMORY);
+    // Evicted, yet still ended: that follows from the newest welcome.
+    assert!(h.s.has_ended(c(1)));
+    assert!(h.s.has_ended(c(ENDED_MEMORY as u64 + 4)));
+    assert!(!h.s.has_ended(c(ENDED_MEMORY as u64 + 5)));
+}
+
+#[test]
+fn t51_a_connection_below_the_live_one_never_welcomed_here_counts_as_ended() {
+    // A shared client: conn 1 ended before this session existed; its late
+    // ops must not touch the session welcomed on conn 2.
+    let mut h = H::new();
+    h.welcome(2);
+    h.registered(true);
+    h.app_on(1, json!({"op": "disable", "id": "srv_anki"}));
+    h.app_on(1, json!({"op": "registered", "services": [{"name": "anki", "id": "srv_x", "url": "https://old/mcp"}]}));
+    h.app_on(1, json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    assert_eq!(h.s.state(), ExposeState::Registered);
+    assert_eq!(h.s.server_id(), Some("srv_anki"));
+    assert!(h.disabled().is_empty() && h.enabled().is_empty());
+    assert_eq!(h.ops(), ["register"]);
+}
+
 #[test]
 fn stale_timer_firings_are_ignored() {
     let mut h = H::new();
@@ -1158,6 +1817,19 @@ fn stale_timer_firings_are_ignored() {
     h.reg_error("INTERNAL", json!({})); // replaces the timer
     h.s.on_timer(stale);
     h.pump();
+    assert_eq!(h.ops(), ["register"]);
+}
+
+#[test]
+fn a_registered_cancels_a_pending_transient_retry() {
+    // The reply to the first register arrives just as its retry is due.
+    let mut h = H::new();
+    h.welcome(1);
+    h.reg_error("TIMEOUT", json!({}));
+    h.advance(MS * 999);
+    h.registered(true);
+    assert!(h.timers.is_empty());
+    h.advance(MS * 60_000);
     assert_eq!(h.ops(), ["register"]);
 }
 

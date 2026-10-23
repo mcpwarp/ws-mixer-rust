@@ -149,8 +149,19 @@ pub(crate) fn forwarded_body(req: &ParsedRequest) -> Bytes {
     }
 }
 
-/// The handler's request; `None` when `http` cannot represent it.
+/// The fetch standard's forbidden methods, matched case-insensitively: no
+/// web `Request` carries them, so they are refused in both modes (§4.5).
+const FORBIDDEN_METHODS: [&str; 3] = ["CONNECT", "TRACE", "TRACK"];
+
+/// The handler's request; `None` when `http` cannot represent it or the
+/// method is forbidden.
 fn to_handler_request(req: ParsedRequest) -> Option<Request<RequestBody>> {
+    if FORBIDDEN_METHODS
+        .iter()
+        .any(|m| req.method.eq_ignore_ascii_case(m))
+    {
+        return None;
+    }
     let method = Method::from_bytes(req.method.as_bytes()).ok()?;
     let target = req.target.split('#').next().unwrap_or_default();
     let uri: http::Uri = format!("https://{}{}", req.host, target).parse().ok()?;
@@ -275,6 +286,11 @@ mod tests {
         let mut p = parsed(&[], "POST", None);
         p.host = "bad host".into();
         assert!(to_handler_request(p).is_none());
+        assert!(to_handler_request(parsed(&[("x-nul", "a\0b")], "POST", None)).is_none());
+        for m in ["CONNECT", "TRACE", "TRACK", "connect", "Track"] {
+            assert!(to_handler_request(parsed(&[], m, None)).is_none(), "{m}");
+        }
+        assert!(to_handler_request(parsed(&[], "PATCH", None)).is_some());
     }
 
     trait IntoData {

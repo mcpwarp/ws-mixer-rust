@@ -42,7 +42,7 @@ impl Settings {
             token: Some(self.token.clone()),
             name: Some(self.name.clone()),
             url: self.url.clone(),
-            kind: None,
+            ..TunnelConfig::default()
         }
     }
 }

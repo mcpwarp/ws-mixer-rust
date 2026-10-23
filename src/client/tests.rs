@@ -349,7 +349,17 @@ async fn http_401_refreshes_the_token_and_redials_immediately() {
     let peer = d2.welcome().await;
     assert_eq!(peer.hello["token"], "t2");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    // The first rejection is not reported.
+    let r = disconnected(&mut events).await;
+    assert_eq!(
+        (r.conn_id, r.phase, r.http_status, r.fatal, r.retry_in),
+        (
+            Some(ConnId(1)),
+            Phase::Dial,
+            Some(401),
+            false,
+            Some(Duration::ZERO)
+        )
+    );
     let c = connected(&mut events).await;
     assert_eq!(c.conn_id, ConnId(2));
     assert!(!c.reconnect);
@@ -361,6 +371,7 @@ async fn second_rejection_is_fatal_in_either_form() {
         let (token, _) = counting_provider();
         let (client, mut events, mut server) = start(builder().token(token));
         server.dial().await.fail_http(401);
+        assert!(!disconnected(&mut events).await.fatal);
         let d2 = server.dial().await;
         let r = if second_is_4011 {
             let mut peer = d2.accept().await;
@@ -386,11 +397,25 @@ async fn second_rejection_is_fatal_in_either_form() {
 
 #[tokio::test(start_paused = true)]
 async fn static_token_rejection_is_fatal_at_once() {
-    let (_client, mut events, mut server) = start(builder());
-    server.dial().await.fail_http(401);
-    let r = disconnected(&mut events).await;
-    assert!(r.fatal);
-    ended(&mut events).await;
+    for is_4011 in [false, true] {
+        let (_client, mut events, mut server) = start(builder());
+        let d = server.dial().await;
+        if is_4011 {
+            let mut p = d.accept().await;
+            p.error_close(ErrorCode::UNAUTHORIZED, "expired").await;
+        } else {
+            d.fail_http(401);
+        }
+        // No Redial before it: the first rejection is final.
+        let r = match next_any(&mut events).await {
+            Event::Disconnected(r) => r,
+            other => panic!("expected Disconnected, got {other:?}"),
+        };
+        assert!(r.fatal, "{r:?}");
+        assert_eq!(r.retry_in, None);
+        ended(&mut events).await;
+        server.no_dial(Duration::from_secs(600)).await;
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -402,6 +427,11 @@ async fn unauthorized_before_welcome_refreshes_after_welcome_is_fatal() {
         .await;
     let mut p2 = server.dial().await.welcome().await;
     assert_eq!(p2.hello["token"], "t2");
+    let r = disconnected(&mut events).await;
+    assert_eq!(
+        (r.phase, r.ws_code, r.fatal),
+        (Phase::Handshake, Some(4011), false)
+    );
     assert_eq!(connected(&mut events).await.conn_id, ConnId(2));
     p2.error_close(ErrorCode::UNAUTHORIZED, "revoked 2").await;
     let r = disconnected(&mut events).await;
@@ -533,6 +563,11 @@ async fn refresh_redial_happens_even_with_max_attempts_exhausted() {
     let p = d3.welcome().await;
     assert_eq!(p.hello["token"], "t3");
     assert_eq!(calls.load(Ordering::SeqCst), 3);
+    let r = disconnected(&mut events).await;
+    assert_eq!(
+        (r.http_status, r.fatal, r.retry_in),
+        (Some(401), false, Some(Duration::ZERO))
+    );
     let c = connected(&mut events).await;
     assert_eq!((c.conn_id, c.reconnect), (ConnId(3), false));
 }
@@ -1206,37 +1241,51 @@ async fn redial_drain_follows_the_drain_event_with_the_jitter_used() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn redial_token_refresh_has_no_disconnected() {
-    let (token, _) = counting_provider();
-    let (_client, mut events, mut server) = start(builder().token(token));
-    server.dial().await.fail_http(401);
-    let n = redial(&mut events).await;
-    assert_eq!(
-        n,
-        RedialNotice {
-            conn_id: Some(ConnId(1)),
-            attempt: 1,
-            delay: Duration::ZERO,
-            cause: RedialCause::TokenRefresh,
+async fn redial_token_refresh_follows_a_non_fatal_disconnected() {
+    // HTTP 401 at the upgrade, then close 4011 before welcome.
+    for is_4011 in [false, true] {
+        let (token, _) = counting_provider();
+        let (_client, mut events, mut server) = start(builder().token(token));
+        let d = server.dial().await;
+        if is_4011 {
+            let mut p = d.accept().await;
+            p.error_close(ErrorCode::UNAUTHORIZED, "expired").await;
+        } else {
+            d.fail_http(401);
         }
-    );
-    let p = server.dial().await.welcome().await;
-    assert_eq!(p.hello["token"], "t2");
-    match next_any(&mut events).await {
-        Event::Connected(c) => assert_eq!(c.conn_id, ConnId(2)),
-        other => panic!("expected Connected, got {other:?}"),
+        let r = match next_any(&mut events).await {
+            Event::Disconnected(r) => r,
+            other => panic!("expected Disconnected, got {other:?}"),
+        };
+        assert_eq!(r.conn_id, Some(ConnId(1)));
+        assert!(!r.fatal, "{r:?}");
+        assert_eq!(r.retry_in, Some(Duration::ZERO));
+        if is_4011 {
+            assert_eq!(r.phase, Phase::Handshake);
+            assert_eq!(r.ws_code, Some(4011));
+            assert_eq!(r.error_code, Some(ErrorCode::UNAUTHORIZED));
+            assert_eq!(r.http_status, None);
+        } else {
+            assert_eq!(r.phase, Phase::Dial);
+            assert_eq!(r.http_status, Some(401));
+            assert_eq!(r.ws_code, None);
+        }
+        assert_eq!(
+            redial(&mut events).await,
+            RedialNotice {
+                conn_id: Some(ConnId(1)),
+                attempt: 1,
+                delay: Duration::ZERO,
+                cause: RedialCause::TokenRefresh,
+            }
+        );
+        let p = server.dial().await.welcome().await;
+        assert_eq!(p.hello["token"], "t2");
+        match next_any(&mut events).await {
+            Event::Connected(c) => assert_eq!(c.conn_id, ConnId(2)),
+            other => panic!("expected Connected, got {other:?}"),
+        }
     }
-
-    // Also for a 4011 before welcome.
-    let (token, _) = counting_provider();
-    let (_client, mut events, mut server) = start(builder().token(token));
-    let mut p1 = server.dial().await.accept().await;
-    p1.error_close(ErrorCode::UNAUTHORIZED, "expired").await;
-    let n = redial(&mut events).await;
-    assert_eq!(
-        (n.conn_id, n.attempt, n.cause),
-        (Some(ConnId(1)), 1, RedialCause::TokenRefresh)
-    );
 }
 
 #[tokio::test(start_paused = true)]

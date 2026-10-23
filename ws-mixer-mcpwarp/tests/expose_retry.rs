@@ -89,7 +89,7 @@ async fn overloaded_resend() {
         retries.take(),
         [(
             2,
-            Duration::from_millis(1000),
+            Duration::from_millis(2000),
             "register failed: OVERLOADED: still busy".into()
         )]
     );

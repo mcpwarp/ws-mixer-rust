@@ -69,8 +69,7 @@ pub(crate) enum RetryKind {
     /// Retry-After.
     Normal,
     /// The one token refresh: call the provider again and redial now. Not
-    /// counted against `attempt` and not reported as a disconnect (Go
-    /// dialAndHandshake, JS connectOnce).
+    /// counted against `attempt`; reported as a non-fatal disconnect.
     RefreshNow,
     /// The one immediate retry after a 4013. Counted against `attempt`.
     ImmediateKeepalive,
@@ -193,8 +192,9 @@ pub(crate) fn decide(
     let plan = classify(state, f, provider);
     let (kind, loud) = match plan {
         Plan::Fatal => return Decision::Fatal(FatalKind::Classified),
-        // Not gated on `enabled`/`max_attempts`: the refresh is part of the
-        // same connect attempt (Go dialAndHandshake, JS connectOnce).
+        // Not gated on `enabled`/`max_attempts`: the refresh reports a
+        // non-fatal `Disconnected`, then `Redial{TokenRefresh}`, and is not
+        // counted as an attempt.
         Plan::Refresh => {
             return Decision::Retry {
                 delay: Duration::ZERO,

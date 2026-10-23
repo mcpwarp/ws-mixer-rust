@@ -2,8 +2,9 @@
 
 The mcpwarp layer over [ws-mixer](https://github.com/mcpwarp/ws-mixer-rust): expose a local MCP
 server at a public mcpwarp URL. Implements §2-§8 of
-[`docs/MCPWARP.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.2/docs/MCPWARP.md) in
-ws-mixer-spec **v0.6.2**, on ws-mixer 0.2.
+[`docs/MCPWARP.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.7.2/docs/MCPWARP.md) in
+ws-mixer-spec **v0.7.2**, on ws-mixer 0.2.1: the single-service profile, a conforming subset of
+the spec's multi-service profile (§6A is not implemented).
 
 An agent dials the edge with a `ws_mixer::Client`, sends a `register` envelope for its service
 after every `welcome`, and answers each stream the edge opens as one HTTP/1.1 request to `/mcp`.
@@ -20,8 +21,8 @@ Native only (tokio). The registration machine is a port of
 
 ## Status
 
-0.1.1, not yet released. Every spec fixture set for the agent side passes (see
-[Conformance](#conformance)).
+0.1.1, not yet released (0.1.0 was tagged, never published). Every single-service fixture of the
+spec's agent-side sets passes; the multi-service ones are skipped (see [Conformance](#conformance)).
 
 Not on crates.io yet. Depend on a checkout next to your project (the form mcpwarp-desktop uses),
 or on the git repository; the quick starts below also use these crates:
@@ -123,10 +124,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   body cap, reconnect policy, `on_retry`, and the handler or target. `build()` rejects bad options
   up front with §5.2's messages, except an invalid reconnect policy: that surfaces when a
   connection starts, as state `error` / `INVALID_CONFIG`.
-- `TunnelConfig` (`enabled`, `token`, `name`, `url`, `kind`) is what changes. It is
-  `Deserialize`, so it can come straight from the host's settings JSON; `Debug` never prints the
-  token. Disabled, or a token that trims to empty, is `off` without dialing. A config equal to the
-  last one is a no-op, unless a `stop`, a conflict or an error came in between.
+- `TunnelConfig` (`enabled`, `token`, `token_provider`, `name`, `url`, `kind`) is what changes.
+  It is `Deserialize`, so it can come straight from the host's settings JSON (`token_provider` is
+  skipped); `Debug` never prints the token. Disabled, or a token that trims to empty, is `off`
+  without dialing. A config equal to the last one is a no-op, unless a `stop`, a conflict or an
+  error came in between. Build literals with `..TunnelConfig::default()`.
+- For a token that changes between dials, set `token_provider` instead of `token` (it wins when
+  both are set). It is called on every dial, and the same provider `Arc` is the same config
+  (`Token` comes from `ws-mixer`, a direct dependency for this):
+
+  ```rust
+  use ws_mixer::{Token, TokenError};
+  use ws_mixer_mcpwarp::TunnelConfig;
+
+  let provider = Token::provider(|| async {
+      std::env::var("MCPWARP_TOKEN").map_err(TokenError::unavailable)
+  });
+  let config = TunnelConfig {
+      enabled: true,
+      token_provider: Some(provider.clone()), // keep `provider` to reconfigure without a redial
+      name: Some("notes".into()),
+      ..TunnelConfig::default()
+  };
+  ```
+
+  `TokenError::unavailable` is a failed dial, retried with backoff; `TokenError::fatal` is
+  `error`/`DISCONNECTED_FATAL`. A token rejected before `welcome` gets one immediate refresh and
+  redial (`on_retry` reason `"token-refresh"`, attempt 1, delay 0); a second rejection is
+  `error`/`UNAUTHORIZED`.
 - `configure` and `stop` are queued when they are called, before the returned future is polled, so
   calls take effect in call order and only the last of a burst dials. Awaiting the future is
   optional.
@@ -217,9 +242,9 @@ lifecycle), the building blocks are public on their own:
 | `RegisterErrorCode`, `AppErrorCode`, `TRANSIENT_REGISTER_ERRORS`, `McpwarpError`, `ConfigError` | §2.6, §5.2-§5.4 | Error codes with `as_str()` / wire parsing and `is_transient()`; config errors carry §5.2's messages and never echo the value. |
 | `is_valid_service_name`, `is_valid_integration_id`, `SERVICE_NAME_RE`, `ServiceKind` | §2.4 | Name and integration-id syntax, without a regex crate. |
 | `Identity`, `Agent` | §3.1, §8 | `hello.meta` (`client: "sdk-rust"`), `hello.agent.runtime`/`os`, the `X-Mcpwarp-Integration` and `User-Agent` headers. `Identity::apply` sets them on a `ws_mixer::ClientBuilder` and vetoes the replacement dial for `drain{replaced}`. |
-| `session::Session` | §2.7, §3.2, §3.3, §5.9 | The sans-IO registration machine for one service: feed it `welcome`, `app`, `drain`, `disconnected`, timer firings; run the `Command`s it queues. It ignores envelopes for other names, and holds a `disable` for an unknown id until `registered` names it. |
-| `bridge::serve_stream`, `ServeContext`, `RequestInfo`, `Handler`, `handler_fn`, `Target`, `target_reply` | §4 | One stream as one HTTP/1.1 request: head limits (64 KiB, 10 s), the `/mcp` rule, `503` while unavailable (per connection, or per request with `state_for_request`), the body cap (`413`), byte-exact error replies, response framing. |
-| `describe_status`, `describe_status_raw`, `DescribeOptions`, `STATUS_LOCALES` | §7 | Status as UI text in `en`, `de`, `es`, `fr`, `ja`, `zh-CN`; locale fallback by language, then `en`; per-call overrides. `_raw` takes wire strings, for codes this version does not know. |
+| `session::Session` | §2.6, §2.7, §3.2, §3.3, §5.9 | The sans-IO registration machine for one service: feed it `welcome`, `app`, `drain`, `disconnected`, timer firings; run the `Command`s it queues. One frame in flight, `OVERLOADED` backoff `min(1000 × 2^(n−1), 30000)` ms; a `disable` for an unknown id is held until `registered` brings it, and dropped with its connection; ops delivered after their connection ended are ignored, except `conflict` and `error`. It assumes it is the only controller on its connection: replies are not matched by name (see [Several services on one client](#several-services-on-one-client)). |
+| `bridge::serve_stream`, `ServeContext`, `RequestInfo`, `Handler`, `handler_fn`, `Target`, `target_reply` | §4 | One stream as one HTTP/1.1 request: head limits (64 KiB, 10 s), the `/mcp` rule, `503` while unavailable (per connection, or per request with `state_for_request`), the body cap (`413`), byte-exact error replies (head-only for `HEAD`, parse errors included), `400` for what a web `Request` cannot carry (`CONNECT`, `TRACE`, `TRACK`, a NUL in a header value), response framing. Single-service: `X-Mcpwarp-Server-Id` / `-Name` are never used for routing. |
+| `describe_status`, `describe_status_raw`, `describe_service_status_raw`, `DescribeOptions`, `STATUS_LOCALES` | §7, §6A.9 | Status as UI text in `en`, `de`, `es`, `fr`, `ja`, `zh-CN`; locale fallback by language, then `en`; per-call overrides. `_raw` takes wire strings, for codes this version does not know. `describe_service_status_raw(state, code, locale)` gives one service's label and detail over wire strings, for a host that shows several services; no overrides. |
 
 ### Bridging and `Handler`
 
@@ -291,10 +316,18 @@ async fn serve(mut events: ws_mixer::Events) {
 
 ### Several services on one client
 
-One `session::Session` per service, all fed the same transport events. A `Session` created while
-a connection is already live must be given `on_welcome(<live conn>)` by you; it is not
-retroactive. A connection that ended before the session existed is ignored by its
-`on_disconnected`.
+One `session::Session` per service, all fed the same `welcome`, `drain` and `disconnected`
+events. A `Session` created while a connection is already live must be given
+`on_welcome(<live conn>)` by you; it is not retroactive. A connection that ended before the
+session existed is ignored by its `on_disconnected`.
+
+A `Session` assumes it is the only controller on its connection (one frame in flight, §2.6):
+replies are not matched by name, so any `registered`, `unregistered` or whole-frame `error` it is
+given answers its outstanding frame, and a `registered` that does not list its service makes it
+re-send. Several sessions on one connection are your job to serialize: let one session's
+`register`/`unregister` go out only once the previous frame on the connection is answered, and
+hand each reply to the session whose frame it answers, by frame order. `disable`, `enable` and
+`conflict` carry an id and name and can go to every session.
 
 A `conflict` is per service; a `drain{replaced}` is per connection. Tell them apart by the
 `SessionEvent::Conflict` reason (or by `on_drain` returning `true`):
@@ -313,7 +346,10 @@ same goes for a paused service: its `503` should come per `Host`, not for the wh
 `ServeContext::state_for_request` gives the state per request, after the head and before any body
 byte: return `ServeState::new(..).conflict(true)` for a taken-over `Host` and `serve_stream`
 resets the stream; return `Disabled`, `Closing` or `Unavailable` and it answers `503` before the
-body is read (§4.4 row 3):
+body is read (§4.4 row 3). A `Host` you do not serve at all stays `Registered`: `503` would claim
+the service exists. Its request reaches your handler, which answers `404` (the dispatcher above
+does). In the spec's words, "a single-service agent serves every stream with its one service"
+(§4.8): the SDK never selects by `Host`, so any routing by `Host` is the handler's.
 
 ```rust
 use std::collections::HashMap;
@@ -332,7 +368,11 @@ fn host_key(host: &str) -> String {
 fn context(states: States) -> ServeContext {
     ServeContext::new(|| RegistrationState::Registered.into()).state_for_request(move |req| {
         let states = states.read().unwrap_or_else(|e| e.into_inner());
-        states.get(&host_key(req.host())).copied().unwrap_or(RegistrationState::Unavailable.into())
+        // An unknown host goes to the handler, which answers 404.
+        states
+            .get(&host_key(req.host()))
+            .copied()
+            .unwrap_or(ServeState::new(RegistrationState::Registered))
     })
 }
 ```
@@ -368,18 +408,19 @@ MSRV: Rust 1.85 (edition 2024).
 
 ## Conformance
 
-The spec's agent-side fixtures (`spec/fixtures/mcpwarp`, MCPWARP.md §10) at v0.6.2:
+The spec's agent-side fixtures (`spec/fixtures/mcpwarp`, MCPWARP.md §10) at v0.7.2. This SDK is
+the single-service profile, so the multi-service fixtures of §10.6 are skipped with a note:
 
 | Set | Result |
 |---|---|
-| envelope | 63: 49 asserted (3 encoder byte checks, 46 decodes); 14 agent -> edge invalid cases are edge-runner only and noted |
-| bridging | 13 of 14 run and pass; `body_413_streamed_reset` applies only to adapters that stream the request body (this SDK buffers it; `body_413` covers the cap) |
-| tunnel | 36/36, on the fake edge with a paused clock |
-| status text | 102 table entries, 26 cases, and the rules file |
+| envelope | 68: 52 asserted (encoder byte checks and decodes); 14 agent -> edge invalid cases are edge-runner only and noted; `register_two_services` and `register_batch_valid` skipped (several services in one frame, which this encoder never sends) |
+| bridging | 22 of 27 run and pass. Skipped: `body_413_streamed_reset`, which applies only to adapters that stream the request body (this SDK buffers it; `body_413` covers the cap), and the four `multi_service_*` (no multi-service routing) |
+| tunnel | 44 of 58: every single-service fixture (01-32 and 34-45) passes on the fake edge with a paused clock; the 14 `ms_*` group fixtures are skipped (no service group) |
+| status text | 144 table entries (the multi-service `service.*` and `lastError.NO_SERVICE_REGISTERED` keys included), 37 cases, and the rules file |
 
 Run them with `make mcpwarp-fixtures` from the repository root (it fetches the spec at `spec.pin`
-and enables `test-util`, which the tunnel runner needs). Fixtures from the upcoming spec v0.6.3
-(not tagged yet) are picked up when `spec.pin` moves.
+and enables `test-util`, which the tunnel runner needs, and `target`). CI fails a run that skips
+anything outside the skips above.
 
 ## Deviations and choices
 
@@ -397,24 +438,21 @@ and enables `test-util`, which the tunnel runner needs). Fixtures from the upcom
   the previous one.
 - **TLS is a `TunnelOptions` / `ExposeConfig` setting** (`tls(ws_mixer::TlsConfig)`), the Rust
   form of §8's WebSocket factory; it does not change per `configure`.
-- **The request target is percent-encoded** before it reaches the handler or target, per the
-  §4.3 rule of the upcoming spec v0.6.3: the fragment is dropped and every byte outside RFC
-  3986's allowed set (non-ASCII, controls, space, `"` `<` `>` `\` `^` `` ` `` `{` `|` `}`) is
-  escaped as `%XX`; `%` itself is kept as written. The v0.6.2 text says the origin-form target is
-  forwarded as is.
-- **A `disable` for an unknown id is held, not adopted**, per the upcoming spec v0.6.3: the edge
-  sends `disable` to every connection of the owner, so before this service's `registered` the id
-  may be another service's. While no server id is known, the latest such `disable` is kept and
-  applied only if the next successful `registered` carries that id (a transient
-  `registered{errors}` keeps the hold); a disconnect, close, take-over, matching
-  `enable` or `SERVER_DISABLED` drops it. The server id therefore never comes from `disable`.
-  The v0.6.2 text adopts the id when none is known.
+- **Single-service subset of the multi-service profile.** v0.7.2 has a multi-service profile
+  (§6A: one connection publishing many services, routed per stream by §4.8); this SDK implements
+  none of it, which the spec allows ("a single-service agent is a conforming subset of the
+  profile"). There is no service group and no `trust_server_id_header` (§4.8 Trust gate):
+  `X-Mcpwarp-Server-Id` and `X-Mcpwarp-Server-Name` reach the application as ordinary headers and
+  never select anything. A single-service handle never selects by `Host` either: every `/mcp`
+  request that reaches a registered handle goes to its handler, which answers `404` itself if it
+  multiplexes internally.
 - **A handler status below 200 or from 600 up** is answered `500 {"error":"handler error"}` and
   reported, like a handler error.
 - **The 64 KiB head cap counts the blank line** that ends the head (`\r\n\r\n`); a head of
   exactly 64 KiB including it fits.
-- In target mode, a request the HTTP types cannot represent (a control character in a header
-  value, say) is answered `400 request cannot be represented as a web Request`, as §4.5 words it.
+- In handler and target mode alike, a request the HTTP types cannot represent (a control
+  character in a header value, say) or a `CONNECT`, `TRACE` or `TRACK` request is answered
+  `400 request cannot be represented as a web Request`, as §4.5 words it.
 
 ## License
 

@@ -44,7 +44,9 @@ fn take(log: &Log) -> Vec<ExposeObservation> {
 fn tag(o: &ExposeObservation) -> String {
     match o {
         ExposeObservation::State(s) => format!("state:{s}"),
-        ExposeObservation::Registered(r) => format!("registered:{}", r.url),
+        ExposeObservation::Registered { registration, .. } => {
+            format!("registered:{}", registration.url)
+        }
         ExposeObservation::Disabled { reason, .. } => format!("disabled:{reason}"),
         ExposeObservation::Enabled { .. } => "enabled".into(),
         ExposeObservation::Conflict(c) => format!("conflict:{}", c.reason),
@@ -144,10 +146,9 @@ async fn observations_from_the_start() {
     );
     tokio::time::sleep(Duration::from_secs(1)).await;
     settle().await;
-    assert_eq!(
-        edge.sent_ops(),
-        ["register", "register", "register", "register"]
-    );
+    // The `registered` above settled the first register before its TIMEOUT
+    // retry fired, so that retry never went out.
+    assert_eq!(edge.sent_ops(), ["register", "register", "register"]);
     edge.app(1, FakeEdge::registered(NAME, "srv_1", URL, false));
     settle().await;
     assert_eq!(

@@ -101,7 +101,8 @@ wire_codes! {
         /// Too many entries in `services[]`.
         TooManyServices => "TOO_MANY_SERVICES",
         /// Too many `app` messages in flight: re-send the outstanding one
-        /// after 1000 ms.
+        /// after `min(1000 × 2^(n−1), 30000)` ms, `n` the consecutive
+        /// `OVERLOADED` replies.
         Overloaded => "OVERLOADED",
         /// Too many connections per owner; the edge then closes with 4014.
         ConnectionLimit => "CONNECTION_LIMIT",

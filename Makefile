@@ -85,9 +85,11 @@ smoke: adapter
 # ws-mixer-mcpwarp's runners for spec/fixtures/mcpwarp (MCPWARP.md §10), with
 # their per-set counts and skip notes printed. The tunnel runner drives the
 # fake edge, so it needs `test-util`; without it it only prints "skipped".
+# `target` is a default feature; it is named so the bridging runner's target
+# fixtures still run if the default features ever change.
 .PHONY: mcpwarp-fixtures
 mcpwarp-fixtures: fetch-spec
-	WSMIXER_SPEC_DIR="$(REPO)/.spec" cargo test -p ws-mixer-mcpwarp --features test-util --test 'fixtures_*' -- --nocapture
+	WSMIXER_SPEC_DIR="$(REPO)/.spec" cargo test -p ws-mixer-mcpwarp --features test-util,target --test 'fixtures_*' -- --nocapture
 
 .PHONY: fmt
 fmt:

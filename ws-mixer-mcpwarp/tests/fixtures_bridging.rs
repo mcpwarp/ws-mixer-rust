@@ -13,9 +13,11 @@
 //! - a handler that fails is reported exactly once.
 //!
 //! Requests are buffered, so `*_reset` fixtures (streaming adapters only)
-//! are listed and skipped (§10.3). `target` fixtures need the `target`
-//! feature; the local server is a TCP listener on an ephemeral port that
-//! stands in for the fixture's `127.0.0.1:3000`.
+//! are listed and skipped (§10.3), as are the multi-service fixtures (a
+//! `services` key, §10.6): this SDK implements the single-service profile.
+//! `target` fixtures need the `target` feature; the local server is a TCP
+//! listener on an ephemeral port that stands in for the fixture's
+//! `127.0.0.1:3000`.
 
 mod common;
 
@@ -33,8 +35,10 @@ use ws_mixer_mcpwarp::bridge::{
     RegistrationState, RequestBody, ServeContext, ServeState, handler_fn, serve_stream,
 };
 
-/// Fixtures the runner must have run for the pinned spec (v0.6.2).
-const MIN_RUN: usize = if cfg!(feature = "target") { 13 } else { 12 };
+/// Fixtures the runner must have run for the pinned spec (v0.7.2): 27 files
+/// minus `body_413_streamed_reset` and the four `multi_service_*`, three of
+/// the 22 in target mode.
+const MIN_RUN: usize = if cfg!(feature = "target") { 22 } else { 19 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Upstream {
@@ -99,6 +103,12 @@ async fn bridging_fixtures() {
             ));
             continue;
         }
+        if fx.get("services").is_some() {
+            notes.push(format!(
+                "note: bridging/{name}: skipped, multi-service profile not implemented (single-service SDK)"
+            ));
+            continue;
+        }
         if fx["mode"] == "target" && !cfg!(feature = "target") {
             notes.push(format!(
                 "note: bridging/{name}: skipped, target mode needs the `target` feature"
@@ -106,6 +116,7 @@ async fn bridging_fixtures() {
             continue;
         }
         run_fixture(&name, &fx).await;
+        println!("bridging/{name}: ok");
         run += 1;
     }
     for n in &notes {
@@ -136,12 +147,44 @@ fn state_of(fx: &Value) -> ServeState {
     }
 }
 
+/// The fixture's `handler`: the application in handler mode, the local
+/// server in target mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Behaviour {
+    /// `200`, the request's content-type and body, no length.
+    Echo,
+    Throw,
+    /// A response with this status and no body.
+    Status(u16),
+    /// Target mode: the local server never sends headers.
+    Hang,
+}
+
+impl Behaviour {
+    fn of(fx: &Value) -> Self {
+        let h = &fx["handler"];
+        match h["behaviour"].as_str().unwrap_or("echo") {
+            "echo" => Self::Echo,
+            "throw" => Self::Throw,
+            "status" => Self::Status(u16::try_from(h["status"].as_u64().unwrap()).unwrap()),
+            "hang" => Self::Hang,
+            other => panic!("handler behaviour {other}"),
+        }
+    }
+
+    /// Whether the SDK answers for the application and reports an error.
+    fn fails(self) -> bool {
+        match self {
+            Self::Throw => true,
+            Self::Status(s) => !(200..600).contains(&s),
+            Self::Echo | Self::Hang => false,
+        }
+    }
+}
+
 async fn run_fixture(name: &str, fx: &Value) {
     let state = state_of(fx);
-    let behaviour = fx["handler"]["behaviour"]
-        .as_str()
-        .unwrap_or("echo")
-        .to_owned();
+    let behaviour = Behaviour::of(fx);
     let errors = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink = errors.clone();
     let ctx = ServeContext::new(move || state)
@@ -152,10 +195,10 @@ async fn run_fixture(name: &str, fx: &Value) {
     let (stream, mut peer) = Stream::new_in_memory(1);
     let (serving, local) = match fx["mode"].as_str().unwrap() {
         "handler" => {
-            let h = fixture_handler(&behaviour, calls.clone());
+            let h = fixture_handler(behaviour, calls.clone());
             (tokio::spawn(serve_stream(stream, &ctx, &h)), None)
         }
-        "target" => serve_target(fx, stream, &ctx, calls.clone()).await,
+        "target" => serve_target(fx, behaviour, stream, &ctx, calls.clone()).await,
         other => panic!("{name}: mode {other}"),
     };
 
@@ -220,7 +263,7 @@ async fn run_fixture(name: &str, fx: &Value) {
         None => panic!("{name}: no upstream key"),
     }
 
-    let from_app = !fx["upstream"].is_null() && behaviour == "echo";
+    let from_app = !fx["upstream"].is_null() && !behaviour.fails() && behaviour != Behaviour::Hang;
     let method = input.split(' ').next().unwrap();
     if from_app {
         let got =
@@ -233,7 +276,7 @@ async fn run_fixture(name: &str, fx: &Value) {
         assert_eq!(raw, want_out, "{name}: an SDK reply is byte-exact");
     }
     let errors = errors.lock().unwrap();
-    if behaviour == "throw" {
+    if behaviour.fails() && !fx["upstream"].is_null() {
         assert_eq!(
             errors.len(),
             1,
@@ -251,16 +294,17 @@ async fn recv(peer: &mut PeerHandle, name: &str) -> Option<PeerEvent> {
 }
 
 /// The fixture's application: `echo` answers `200` with the request's
-/// content-type and body and no length; `throw` fails.
+/// content-type and body and no length; `throw` fails; `status` answers
+/// that status, which `http` holds up to 999.
 fn fixture_handler(
-    behaviour: &str,
+    behaviour: Behaviour,
     calls: Calls,
 ) -> impl ws_mixer_mcpwarp::bridge::Handler + Clone {
-    let throw = match behaviour {
-        "echo" => false,
-        "throw" => true,
-        other => panic!("handler behaviour {other}"),
-    };
+    assert_ne!(
+        behaviour,
+        Behaviour::Hang,
+        "hang is a target-mode behaviour"
+    );
     handler_fn(move |req: http::Request<RequestBody>| {
         let calls = calls.clone();
         async move {
@@ -279,8 +323,14 @@ fn fixture_handler(
                 headers,
                 body: Some(String::from_utf8_lossy(&body).into_owned()),
             });
-            if throw {
-                return Err("fixture handler throws".into());
+            match behaviour {
+                Behaviour::Throw => return Err("fixture handler throws".into()),
+                Behaviour::Status(s) => {
+                    let mut res = Response::new(Full::new(Bytes::new()));
+                    *res.status_mut() = http::StatusCode::from_u16(s)?;
+                    return Ok(res);
+                }
+                Behaviour::Echo | Behaviour::Hang => {}
             }
             let mut res = Response::new(Full::new(body));
             if let Some(ct) = content_type {
@@ -294,6 +344,7 @@ fn fixture_handler(
 #[cfg(feature = "target")]
 async fn serve_target(
     fx: &Value,
+    behaviour: Behaviour,
     stream: Stream,
     ctx: &ServeContext,
     calls: Calls,
@@ -303,9 +354,9 @@ async fn serve_target(
 ) {
     use ws_mixer_mcpwarp::bridge::{DEFAULT_TARGET_TIMEOUT, Target};
 
-    assert_eq!(
-        fx["handler"]["behaviour"], "hang",
-        "target fixtures describe a hanging server"
+    assert!(
+        matches!(behaviour, Behaviour::Echo | Behaviour::Hang),
+        "target fixtures describe an echoing or a hanging server"
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -317,7 +368,7 @@ async fn serve_target(
         .as_u64()
         .map_or(DEFAULT_TARGET_TIMEOUT, Duration::from_millis);
     let target = Target::new(url.parse().unwrap(), timeout);
-    let local = tokio::spawn(hanging_server(listener, addr, calls));
+    let local = tokio::spawn(local_server(listener, addr, behaviour, calls));
     (
         tokio::spawn(serve_stream(stream, ctx, &target)),
         Some(local),
@@ -327,6 +378,7 @@ async fn serve_target(
 #[cfg(not(feature = "target"))]
 async fn serve_target(
     _: &Value,
+    _: Behaviour,
     _: Stream,
     _: &ServeContext,
     _: Calls,
@@ -337,13 +389,19 @@ async fn serve_target(
     unreachable!("target fixtures are skipped without the `target` feature")
 }
 
-/// Records the request it receives, then never answers. Host, framing and
+/// Records the first request it receives, then answers it as `echo` does
+/// (chunked, so without a length) or, for `hang`, never. Host, framing and
 /// the URL are mapped back to what a fetch-style client was handed: the
 /// wire's `host` must be the target's, and `content-length` /
 /// `transfer-encoding` are the client's framing, not request headers.
 #[cfg(feature = "target")]
-async fn hanging_server(listener: tokio::net::TcpListener, addr: String, calls: Calls) {
-    use tokio::io::AsyncReadExt;
+async fn local_server(
+    listener: tokio::net::TcpListener,
+    addr: String,
+    behaviour: Behaviour,
+    calls: Calls,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (mut sock, _) = listener.accept().await.unwrap();
     let mut buf = Vec::new();
@@ -388,13 +446,28 @@ async fn hanging_server(listener: tokio::net::TcpListener, addr: String, calls: 
             .filter(|(n, _)| !matches!(n.as_str(), "host" | "content-length" | "transfer-encoding"))
             .map(|(n, v)| (n.clone(), v.as_bytes())),
     );
+    let body = &buf[head_end..head_end + length];
     calls.lock().unwrap().push(Upstream {
         method,
         url: format!("http://{addr}{target}"),
         headers,
-        body: Some(String::from_utf8_lossy(&buf[head_end..head_end + length]).into_owned()),
+        body: Some(String::from_utf8_lossy(body).into_owned()),
     });
-    // Hang with the connection open until the runner aborts this task.
+    if behaviour == Behaviour::Echo {
+        let mut res = b"HTTP/1.1 200 OK\r\n".to_vec();
+        if let Some((_, ct)) = pairs.iter().find(|(n, _)| n == "content-type") {
+            res.extend_from_slice(format!("content-type: {ct}\r\n").as_bytes());
+        }
+        res.extend_from_slice(b"transfer-encoding: chunked\r\n\r\n");
+        if !body.is_empty() {
+            res.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+            res.extend_from_slice(body);
+            res.extend_from_slice(b"\r\n");
+        }
+        res.extend_from_slice(b"0\r\n\r\n");
+        sock.write_all(&res).await.unwrap();
+    }
+    // Keep the connection open until the runner aborts this task.
     std::future::pending::<()>().await;
     drop(sock);
 }

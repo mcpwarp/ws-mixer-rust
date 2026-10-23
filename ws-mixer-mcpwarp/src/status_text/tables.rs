@@ -1,4 +1,4 @@
-//! The six normative status-text tables (MCPWARP.md §7), string-identical to
+//! The six normative status-text tables (MCPWARP.md §7, §6A.9), string-identical to
 //! `spec/fixtures/mcpwarp/status-text/<locale>.json`. Changing a string is a
 //! spec release; `tests/fixtures_status_text.rs` fails on any drift.
 
@@ -8,6 +8,10 @@ pub(crate) struct Table {
     pub(crate) joiner: &'static str,
     pub(crate) states: [(&'static str, &'static str); 6],
     pub(crate) codes: [(&'static str, &'static str); 13],
+    /// `service.<state>` labels (§6A.9), in `ServiceState` order.
+    pub(crate) services: [(&'static str, &'static str); 6],
+    /// The `lastError.NO_SERVICE_REGISTERED` detail (§6A.9).
+    pub(crate) no_service_registered: &'static str,
 }
 
 impl Table {
@@ -17,6 +21,10 @@ impl Table {
 
     pub(crate) fn code(&self, key: &str) -> Option<&'static str> {
         lookup(&self.codes, key)
+    }
+
+    pub(crate) fn service(&self, key: &str) -> Option<&'static str> {
+        lookup(&self.services, key)
     }
 }
 
@@ -59,6 +67,15 @@ const EN: Table = Table {
         ("DISCONNECTED_FATAL", "Connection to mcpwarp failed"),
         ("INTERNAL", "Unexpected error"),
     ],
+    services: [
+        ("pending", "Registering…"),
+        ("active", "Active"),
+        ("disabled", "Disabled"),
+        ("rejected", "Rejected"),
+        ("taken_over", "Taken over by another instance"),
+        ("unregistered", "Removed"),
+    ],
+    no_service_registered: "No service could be registered",
 };
 
 const DE: Table = Table {
@@ -102,6 +119,15 @@ const DE: Table = Table {
         ("DISCONNECTED_FATAL", "Verbindung zu mcpwarp fehlgeschlagen"),
         ("INTERNAL", "Unerwarteter Fehler"),
     ],
+    services: [
+        ("pending", "Wird registriert…"),
+        ("active", "Aktiv"),
+        ("disabled", "Deaktiviert"),
+        ("rejected", "Abgelehnt"),
+        ("taken_over", "Von einer anderen Instanz übernommen"),
+        ("unregistered", "Entfernt"),
+    ],
+    no_service_registered: "Kein Dienst konnte registriert werden",
 };
 
 const ES: Table = Table {
@@ -136,6 +162,15 @@ const ES: Table = Table {
         ("DISCONNECTED_FATAL", "No se pudo conectar con mcpwarp"),
         ("INTERNAL", "Error inesperado"),
     ],
+    services: [
+        ("pending", "Registrando…"),
+        ("active", "Activo"),
+        ("disabled", "Desactivado"),
+        ("rejected", "Rechazado"),
+        ("taken_over", "Tomado por otra instancia"),
+        ("unregistered", "Eliminado"),
+    ],
+    no_service_registered: "No se pudo registrar ningún servicio",
 };
 
 const FR: Table = Table {
@@ -171,6 +206,15 @@ const FR: Table = Table {
         ("DISCONNECTED_FATAL", "Échec de la connexion à mcpwarp"),
         ("INTERNAL", "Erreur inattendue"),
     ],
+    services: [
+        ("pending", "Enregistrement…"),
+        ("active", "Actif"),
+        ("disabled", "Désactivé"),
+        ("rejected", "Refusé"),
+        ("taken_over", "Repris par une autre instance"),
+        ("unregistered", "Retiré"),
+    ],
+    no_service_registered: "Aucun service n'a pu être enregistré",
 };
 
 const JA: Table = Table {
@@ -206,6 +250,15 @@ const JA: Table = Table {
         ("DISCONNECTED_FATAL", "mcpwarp への接続に失敗しました"),
         ("INTERNAL", "予期しないエラー"),
     ],
+    services: [
+        ("pending", "登録中…"),
+        ("active", "有効"),
+        ("disabled", "無効"),
+        ("rejected", "拒否されました"),
+        ("taken_over", "別のインスタンスに取得されました"),
+        ("unregistered", "削除済み"),
+    ],
+    no_service_registered: "登録できたサービスがありません",
 };
 
 const ZH_CN: Table = Table {
@@ -238,6 +291,15 @@ const ZH_CN: Table = Table {
         ("DISCONNECTED_FATAL", "无法连接到 mcpwarp"),
         ("INTERNAL", "意外错误"),
     ],
+    services: [
+        ("pending", "正在注册…"),
+        ("active", "已启用"),
+        ("disabled", "已停用"),
+        ("rejected", "已拒绝"),
+        ("taken_over", "已被另一个实例接管"),
+        ("unregistered", "已移除"),
+    ],
+    no_service_registered: "未能注册任何服务",
 };
 
 #[cfg(test)]
@@ -254,6 +316,20 @@ mod tests {
             let codes: Vec<_> = t.codes.iter().map(|(k, _)| *k).collect();
             let want: Vec<_> = TunnelStatusCode::ALL.iter().map(|c| c.as_str()).collect();
             assert_eq!(codes, want, "{}", t.locale);
+            let services: Vec<_> = t.services.iter().map(|(k, _)| *k).collect();
+            assert_eq!(
+                services,
+                [
+                    "pending",
+                    "active",
+                    "disabled",
+                    "rejected",
+                    "taken_over",
+                    "unregistered"
+                ],
+                "{}",
+                t.locale
+            );
         }
     }
 
@@ -262,7 +338,9 @@ mod tests {
     fn lint() {
         let en = &TABLES[0];
         for t in &TABLES {
-            for (key, s) in t.states.iter().chain(&t.codes) {
+            let no_service = ("NO_SERVICE_REGISTERED", t.no_service_registered);
+            let all = t.states.iter().chain(&t.codes).chain(&t.services);
+            for (key, s) in all.chain([&no_service]) {
                 let at = format!("{} {key}", t.locale);
                 assert!(!s.is_empty(), "{at}");
                 assert!(!s.contains("..."), "{at}: ASCII '...'");
@@ -285,6 +363,14 @@ mod tests {
             for (key, s) in t.codes.iter() {
                 assert_ne!(en.code(key), Some(*s), "{} codes.{key}", t.locale);
             }
+            for (key, s) in t.services.iter() {
+                assert_ne!(en.service(key), Some(*s), "{} service.{key}", t.locale);
+            }
+            assert_ne!(
+                en.no_service_registered, t.no_service_registered,
+                "{} NO_SERVICE_REGISTERED",
+                t.locale
+            );
         }
     }
 }

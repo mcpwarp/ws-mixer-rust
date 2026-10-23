@@ -5,7 +5,8 @@
 //! service with a `register` envelope after every `welcome`, and answers each
 //! stream the edge opens as one HTTP/1.1 request to `/mcp`.
 //!
-//! This release ships the Tier 1 building blocks of spec v0.6.2:
+//! This release ships the single-service profile of spec v0.7.2 (its
+//! multi-service profile, §6A, is not implemented):
 //!
 //! - the envelope: [`encode_register`] / [`encode_unregister`] (byte-exact,
 //!   §2.2) and [`decode_envelope`] (§2.8), with [`RegisterErrorCode`],
@@ -23,11 +24,15 @@
 //! - [`expose()`]: one client, one registered service, every request served
 //!   (§5), with [`ExposeHandle`] and [`ExposeEvent`];
 //! - the tunnel controller ([`Tunnel`], §6): configure at runtime, one
-//!   [`TunnelStatus`];
-//! - status text ([`describe_status`], §7).
+//!   [`TunnelStatus`], a static token or a
+//!   [`token_provider`](TunnelConfig::token_provider);
+//! - status text ([`describe_status`], §7), and one service's label for a
+//!   host listing several ([`describe_service_status_raw`], §6A.9; the
+//!   spec-shaped `describe_service_status` is reserved for a multi-service
+//!   controller).
 //!
 //! [ws-mixer]: https://docs.rs/ws-mixer
-//! [MCPWARP.md]: https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.2/docs/MCPWARP.md
+//! [MCPWARP.md]: https://github.com/mcpwarp/ws-mixer-spec/blob/v0.7.2/docs/MCPWARP.md
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -60,8 +65,8 @@ pub use names::{
 };
 pub use session::{Conflict, ExposeState, Registration, RetryInfo};
 pub use status_text::{
-    DescribeOptions, STATUS_LOCALES, StatusMessages, StatusText, describe_status,
-    describe_status_raw,
+    DescribeOptions, STATUS_LOCALES, StatusMessages, StatusText, describe_service_status_raw,
+    describe_status, describe_status_raw,
 };
 pub use tunnel::status::{TunnelState, TunnelStatus, TunnelStatusCode, last_error};
 pub use tunnel::{
