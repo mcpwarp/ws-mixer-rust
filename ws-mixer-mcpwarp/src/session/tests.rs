@@ -874,6 +874,41 @@ fn an_empty_registered_during_an_overloaded_pause_answers_nothing() {
 }
 
 #[test]
+fn a_listed_registered_during_an_overloaded_pause_resets_the_counter() {
+    let mut h = H::new();
+    h.welcome(1);
+    assert_eq!(overloaded_resend_after(&mut h), 1000);
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.registered(false);
+    assert!(h.timers.is_empty(), "the 2000 ms re-send is cancelled");
+    h.app(json!({"op": "disable", "id": "srv_anki"}));
+    h.app(json!({"op": "enable", "id": "srv_anki", "name": "anki"}));
+    assert_eq!(overloaded_resend_after(&mut h), 1000);
+}
+
+#[test]
+fn an_error_op_during_an_overloaded_pause_keeps_the_counter() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.app(json!({"op": "error", "code": "UNKNOWN_OP"}));
+    h.advance(MS * 1000);
+    assert_eq!(h.ops(), ["register", "register"]);
+    assert_eq!(overloaded_resend_after(&mut h), 2000);
+}
+
+#[test]
+fn an_empty_registered_during_an_overloaded_pause_keeps_the_counter() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    h.app(json!({"op": "registered"}));
+    h.advance(MS * 1000);
+    assert_eq!(h.ops(), ["register", "register"]);
+    assert_eq!(overloaded_resend_after(&mut h), 2000);
+}
+
+#[test]
 fn a_registered_with_nothing_outstanding_settles_the_handle() {
     // §3.2 One controller per connection: one name, accepted by name.
     let mut h = H::new();
@@ -1544,6 +1579,44 @@ fn a_drain_replacement_registers_on_its_welcome() {
     assert!(h.s.is_superseded(c(1)));
     h.registered(false);
     assert_eq!(h.s.state(), ExposeState::Registered);
+}
+
+#[test]
+fn a_drain_replacements_welcome_cancels_an_overloaded_resend_paused_on_the_drained_connection() {
+    // §2.6: the pause and its counter belong to connection 1; the welcome of
+    // connection 2 starts fresh with its own register.
+    let mut h = H::new();
+    h.welcome(1);
+    h.app(json!({"op": "error", "code": "OVERLOADED", "message": "busy"}));
+    let (stale, _) = h.timers[0];
+    assert_eq!(stale.kind(), TimerKind::Overload);
+    assert!(!h.drain(1, DrainReason::Rollout));
+    h.welcome(2);
+    assert_eq!(h.sent, [register_env(), register_env()]);
+    assert!(h.timers.is_empty(), "no timer from connection 1 remains");
+    // A firing the driver failed to cancel is ignored too.
+    h.s.on_timer(stale);
+    h.pump();
+    assert_eq!(h.ops(), ["register", "register"]);
+    assert_eq!(h.s.state(), ExposeState::Registering);
+    // The OVERLOADED counter starts over on connection 2.
+    assert_eq!(overloaded_resend_after(&mut h), 1000);
+}
+
+#[test]
+fn a_stale_transient_retry_from_the_drained_connection_does_not_fire_on_the_replacement() {
+    let mut h = H::new();
+    h.welcome(1);
+    h.reg_error("INTERNAL", json!({}));
+    let (stale, _) = h.timers[0];
+    assert_eq!(stale.kind(), TimerKind::RegisterRetry);
+    assert!(!h.drain(1, DrainReason::Rollout));
+    h.welcome(2);
+    assert_eq!(h.sent, [register_env(), register_env()]);
+    assert!(h.timers.is_empty(), "no timer from connection 1 remains");
+    h.s.on_timer(stale);
+    h.pump();
+    assert_eq!(h.ops(), ["register", "register"]);
 }
 
 // --- §5.9 / §6.8 connection identity ---------------------------------------------

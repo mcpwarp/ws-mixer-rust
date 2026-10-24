@@ -3,14 +3,18 @@
 //!
 //! - every `<locale>.json` has exactly the 17 legal `<state>.<code|none>`
 //!   keys, and each entry equals `describe_status({state, code})`;
-//! - the seven multi-service keys of §6A.9: each `service.<state>` equals
-//!   `describe_service_status_raw(state)`, `lastError.NO_SERVICE_REGISTERED` the
-//!   group's `error`/`INTERNAL` status;
+//! - the seven multi-service keys of §6A.9 (`rules.json` `hostOnly`): each
+//!   `service.<state>` equals `describe_service_status_raw(state)`,
+//!   `lastError.NO_SERVICE_REGISTERED` the group's `error`/`INTERNAL` status;
 //! - the strings derived from each table (a state's label, a code's
 //!   sentence) equal the embedded ones, so the shipped tables cannot drift;
 //! - `rules.json` constants match what the implementation hard-codes;
 //! - every `cases.json` case gives exactly `expect`, `input.service` cases
 //!   through `describe_service_status_raw`.
+//!
+//! The `hostOnly` keys and `hostOnlyCases` are host guidance (MCPWARP.md
+//! §10.6), which an SDK runner may skip; they are run here because the crate
+//! ships `describe_service_status_raw` and the group sentence for hosts.
 
 mod common;
 
@@ -23,7 +27,7 @@ use ws_mixer_mcpwarp::{
     describe_service_status_raw, describe_status, describe_status_raw, last_error,
 };
 
-/// Floors for the pinned spec (v0.7.2): raise them as the corpus grows.
+/// Floors for the pinned spec (v0.8.0): raise them as the corpus grows.
 const MIN_TABLE_ENTRIES: usize = 144;
 const MIN_CASES: usize = 37;
 
@@ -431,6 +435,14 @@ fn status_text_rules() {
         let (locale, key) = entry.as_str().unwrap().split_once(':').unwrap();
         assert!(tables[locale].contains_key(key), "newInSpec {locale}:{key}");
     }
+
+    let host_only: Vec<&str> = rules["hostOnly"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().unwrap())
+        .collect();
+    assert_eq!(sorted(&host_only), MULTI_SERVICE_KEYS, "hostOnly");
 
     // keyFormat.pattern: every table key is "<state>.<none|CODE>" or one of
     // the multi-service keys.

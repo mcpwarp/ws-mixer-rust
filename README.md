@@ -1,6 +1,6 @@
 # ws-mixer
 
-Rust client SDK for the [ws-mixer.v1](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.7.2/docs/WIRE.md)
+Rust client SDK for the [ws-mixer.v1](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.0/docs/WIRE.md)
 protocol: many independent, flow-controlled byte streams multiplexed over one WebSocket.
 
 The server opens streams; the client accepts each one as a `Stream` implementing tokio's
@@ -16,7 +16,7 @@ server side) and [ws-mixer-js](https://github.com/mcpwarp/ws-mixer-js) (Node cli
 ## Status
 
 0.2.1, not yet released; the first version to go to crates.io (0.2.0 was tagged, never
-published). Implements the client role of spec **v0.7.2** (`spec.pin`). The spec runner's
+published). Implements the client role of spec **v0.8.0** (`spec.pin`). The spec runner's
 conformance suite passes in full:
 
 - fixture mode: 25/25 client fixtures
@@ -55,16 +55,16 @@ own (see [Releasing](#releasing)).
 ## mcpwarp layer
 
 [`ws-mixer-mcpwarp`](ws-mixer-mcpwarp/README.md) implements
-[MCPWARP.md](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.7.2/docs/MCPWARP.md) §2-§8 of spec
-v0.7.2 on this crate: expose a local MCP server at a public mcpwarp URL. It offers `expose()`
+[MCPWARP.md](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.0/docs/MCPWARP.md) §2-§8 of spec
+v0.8.0 on this crate: expose a local MCP server at a public mcpwarp URL. It offers `expose()`
 (one service, one call), `Tunnel` (a controller for apps with a settings UI, with status text in
 six locales) and the Tier 1 building blocks (envelope, codes, identity, the sans-IO registration
-machine, request bridging) for agents that run their own `ws_mixer::Client`. It is the
-single-service subset of the spec's multi-service profile (§6A not implemented) and passes every
-single-service agent-side mcpwarp fixture: envelope 68 (52 asserted, 14 edge-runner only, 2
-multi-service skipped), bridging 22 of 27 (one applies only to streamed request bodies, four are
-multi-service), tunnel 44 of 58 (the 14 `ms_*` group fixtures skipped), status text 144 table
-entries and 37 cases.
+machine, request bridging) for agents that run their own `ws_mixer::Client`. Its scope is one
+service per connection, like every SDK (§6A is informative host guidance), and it passes every
+SDK-conformance agent-side mcpwarp fixture: envelope 68 (52 asserted, 14 edge-runner only, 2
+host-guidance encodes skipped), bridging 22 of 27 (one applies only to streamed request bodies,
+four are host guidance), tunnel 44 of 58 (the 14 `ms_*` host-guidance fixtures skipped), status
+text 144 table entries and 37 cases.
 
 ## Install
 
@@ -199,7 +199,7 @@ make conformance-pair      # spec runner, ws-mixer-go server x this client (need
 cargo deny check           # licenses, advisories, duplicate crates
 ```
 
-`make fetch-spec` and `make fetch-goserver` shallow-clone ws-mixer-spec at `spec.pin` (v0.7.2)
+`make fetch-spec` and `make fetch-goserver` shallow-clone ws-mixer-spec at `spec.pin` (v0.8.0)
 into `.spec/` and ws-mixer-go at `goserver.pin` (v0.9.0) into `.goserver/`, re-cloning when the
 pin changes; the conformance targets do this on their own. The spec fixture tests look in
 `$WSMIXER_SPEC_DIR`, then `.spec/` (ws-mixer also tries `../ws-mixer-spec`), and are skipped when
@@ -227,13 +227,21 @@ How a desktop host that exposes several local MCP servers should use the mcpwarp
   `encode_register` yourself. Feed every session the same `on_drain` and `on_disconnected`
   events. A session created while a connection is already live needs `on_welcome(<live conn>)`
   from you; it is not retroactive.
-- **Serialize frames and route replies by frame order.** A `Session` assumes it is the only
+- **Hold back triggers and route replies by frame order.** A `Session` assumes it is the only
   controller on its connection: it keeps one frame in flight, and replies (`registered`,
   `unregistered`, a whole-frame `error`) are not matched by name, so any reply it is given answers
-  its outstanding frame, and a `registered` that does not list its service makes it re-send. Send
-  one session's `register`/`unregister` only once the previous frame on the connection is
-  answered, and pass each reply only to the session whose frame it answers. `disable`, `enable`
-  and `conflict` carry an id and name and can go to every session.
+  its outstanding frame, and a `registered` that does not list its service makes it re-send. A
+  session marks a frame outstanding, records that it sent `register` on this connection, and
+  starts the 2000 ms close budget for an `unregister` when it emits the `SendApp`, so hold back
+  its triggers (`on_welcome`, any of its timer firings (transient retry or `OVERLOADED`
+  re-send), an `enable`, `close()`) until the connection's slot is free and never buffer an
+  emitted frame. A reply may make the session emit its next queued frame in the same call, which
+  then holds the slot before any other session may send. Route `registered`, `unregistered` and
+  a whole-frame `error` only to the session whose frame is on the wire, by frame order. Free the
+  slot only on a reply, a `Disconnected` or a replacement welcome, never on a session's local
+  state change, and key the queue by connection id across drains. `disable`, `enable` and
+  `conflict` carry an id and name and can go to every session (an `enable` as a held-back
+  trigger).
 - **Handle a session's close commands per service.** `Command::Fatal` and
   `Command::CloseGraceful` mean "close the client" for a single-service agent. On a shared
   client, treat them as the end of that one service: drop or reset its session and stop routing
@@ -262,7 +270,7 @@ How a desktop host that exposes several local MCP servers should use the mcpwarp
   `Retry-After` header; `bridge::target_reply` tells you a `Target` found its child down.
 - **An unknown `Host` is `Registered`, answered `404` by the handler.** Do not return
   `Unavailable` for a host you do not serve: a `503` claims the service exists. The SDK never
-  routes by `Host` or by `X-Mcpwarp-Server-Id` (single-service profile), so the handler's
+  routes by `Host` or by `X-Mcpwarp-Server-Id` (§4.8: an SDK does no routing), so the handler's
   dispatcher answers `404` for a host it has no child for.
 - **`describe_service_status_raw(state, code, locale)`** gives one service's label and detail
   (§6A.9) for a list of services; `describe_status` stays the connection's line.

@@ -8,13 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## 0.2.1 (unreleased)
 
 The first release published to crates.io: 0.2.0 was tagged (`ws-mixer-v0.2.0`) but never
-published. Implements the client role of ws-mixer spec v0.7.2; conformance 25/25 client fixtures
+published. Implements the client role of ws-mixer spec v0.8.0; conformance 25/25 client fixtures
 (including the new `window_stale_retired_stream` sequence) and 10/10 pair scenarios against
 ws-mixer-go v0.9.0.
 
 ### Changed
 
-- Pins spec v0.7.2 and ws-mixer-go v0.9.0 (after the 0.2.0 tag they had moved to spec v0.6.2
+- Pins spec v0.8.0 and ws-mixer-go v0.9.0 (after the 0.2.0 tag they had moved to spec v0.6.2
   and go v0.9.0 with no code change).
 - Control messages accept any JSON number whose value is integral as that integer in every
   integer field (`"v": 1.0` and `1e0` are `1`, WIRE.md §2.7 Integer fields), then apply the

@@ -1,9 +1,9 @@
 //! `spec/fixtures/mcpwarp/envelope` (MCPWARP.md §10.2), as an agent runner:
 //!
 //! - `register` / `unregister` valid cases: the encoder's output equals
-//!   `message`, byte for byte. The encoder sends one service per frame
-//!   (single-service profile), so a valid case with several services is
-//!   agent output this SDK never produces; it is listed and skipped (§10.2).
+//!   `message`, byte for byte. The encoder sends one service per frame,
+//!   so the encode side of a valid case with several services is host
+//!   guidance (MCPWARP.md §10.6); it is listed and skipped.
 //! - Edge -> agent cases: `wire_valid: true` decodes without error, with the
 //!   §2.3 defaults; `MALFORMED_ENVELOPE` fails with a message containing
 //!   `message_contains`; `UNSUPPORTED_VERSION` / `UNKNOWN_OP` decode as
@@ -20,7 +20,7 @@ use ws_mixer_mcpwarp::{
     encode_unregister, is_valid_service_name,
 };
 
-/// Floors for the pinned spec (v0.7.2): raise them as the corpus grows.
+/// Floors for the pinned spec (v0.8.0): raise them as the corpus grows.
 const MIN_ENCODED: usize = 3;
 const MIN_DECODED: usize = 49;
 
@@ -72,11 +72,11 @@ fn envelope_fixtures() {
     }
     for name in &multi {
         println!(
-            "note: envelope/{name}: agent -> edge case with several services, which a single-service encoder never sends (§10.6); skipped"
+            "note: envelope/{name}: agent -> edge case with several services, encode side is host guidance (MCPWARP.md §10.6); skipped"
         );
     }
     println!(
-        "envelope {} ({} asserted, {} noted, {} multi-service skipped)",
+        "envelope {} ({} asserted, {} noted, {} host-guidance skipped)",
         encoded + decoded + noted.len() + multi.len(),
         encoded + decoded,
         noted.len(),

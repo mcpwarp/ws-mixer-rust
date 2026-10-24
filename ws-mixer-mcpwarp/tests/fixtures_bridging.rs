@@ -14,7 +14,7 @@
 //!
 //! Requests are buffered, so `*_reset` fixtures (streaming adapters only)
 //! are listed and skipped (§10.3), as are the multi-service fixtures (a
-//! `services` key, §10.6): this SDK implements the single-service profile.
+//! `services` key): host guidance (MCPWARP.md §10.6), not SDK conformance.
 //! `target` fixtures need the `target` feature; the local server is a TCP
 //! listener on an ephemeral port that stands in for the fixture's
 //! `127.0.0.1:3000`.
@@ -35,7 +35,7 @@ use ws_mixer_mcpwarp::bridge::{
     RegistrationState, RequestBody, ServeContext, ServeState, handler_fn, serve_stream,
 };
 
-/// Fixtures the runner must have run for the pinned spec (v0.7.2): 27 files
+/// Fixtures the runner must have run for the pinned spec (v0.8.0): 27 files
 /// minus `body_413_streamed_reset` and the four `multi_service_*`, three of
 /// the 22 in target mode.
 const MIN_RUN: usize = if cfg!(feature = "target") { 22 } else { 19 };
@@ -105,7 +105,7 @@ async fn bridging_fixtures() {
         }
         if fx.get("services").is_some() {
             notes.push(format!(
-                "note: bridging/{name}: skipped, multi-service profile not implemented (single-service SDK)"
+                "note: bridging/{name}: skipped, host guidance (MCPWARP.md §10.6)"
             ));
             continue;
         }

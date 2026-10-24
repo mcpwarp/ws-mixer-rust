@@ -150,8 +150,8 @@ pub fn describe_status_raw(
 /// code) and for `disabled` with code `DISABLED` (the dashboard sentence);
 /// a service's `lastError` is never shown.
 ///
-/// The spec-shaped `describe_service_status(&ServiceStatus, &DescribeOptions)`
-/// (§9.2) is reserved for a future multi-service controller.
+/// There is no spec-shaped `describe_service_status(&ServiceStatus, &DescribeOptions)`
+/// (§9.2): a multi-service host builds its own over this one (§6A, informative).
 ///
 /// ```
 /// use ws_mixer_mcpwarp::describe_service_status_raw;

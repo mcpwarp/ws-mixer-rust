@@ -116,13 +116,13 @@ jobs:
           if grep -qF 'tunnel: skipped' "$log"; then
             fail "tunnel runner skipped: built without test-util"
           fi
-          # Buffered request bodies (no *_reset) and the single-service
-          # profile (no multi_service_*), MCPWARP.md §10.3, §10.6.
+          # Buffered request bodies (no *_reset) and the host guidance
+          # (multi_service_*), MCPWARP.md §10.3, §10.6.
           allowed='body_413_streamed_reset multi_service_route_by_header multi_service_route_by_host multi_service_unknown_service_503 multi_service_unknown_service_non_mcp_404'
           for name in $(sed -nE 's|.*note: bridging/([a-z0-9_]+): skipped.*|\1|p' "$log"); do
             [[ " $allowed " == *" $name "* ]] || fail "bridging/$name skipped, not a documented skip"
           done
-          # Only the multi-service group fixtures (ms_*) may be skipped.
+          # Only the host-guidance group fixtures (ms_*) may be skipped.
           for name in $(sed -nE 's|.*skip: tunnel/([^:]+): .*|\1|p' "$log"); do
             [[ "$name" == ms_* ]] || fail "tunnel/$name skipped, not an ms_* fixture"
           done

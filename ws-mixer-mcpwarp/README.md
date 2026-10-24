@@ -2,9 +2,9 @@
 
 The mcpwarp layer over [ws-mixer](https://github.com/mcpwarp/ws-mixer-rust): expose a local MCP
 server at a public mcpwarp URL. Implements §2-§8 of
-[`docs/MCPWARP.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.7.2/docs/MCPWARP.md) in
-ws-mixer-spec **v0.7.2**, on ws-mixer 0.2.1: the single-service profile, a conforming subset of
-the spec's multi-service profile (§6A is not implemented).
+[`docs/MCPWARP.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.0/docs/MCPWARP.md) in
+ws-mixer-spec **v0.8.0**, on ws-mixer 0.2.1: one service per connection, the scope of every SDK
+(§6A, multi-service hosts, is informative host guidance).
 
 An agent dials the edge with a `ws_mixer::Client`, sends a `register` envelope for its service
 after every `welcome`, and answers each stream the edge opens as one HTTP/1.1 request to `/mcp`.
@@ -21,8 +21,8 @@ Native only (tokio). The registration machine is a port of
 
 ## Status
 
-0.1.1, not yet released (0.1.0 was tagged, never published). Every single-service fixture of the
-spec's agent-side sets passes; the multi-service ones are skipped (see [Conformance](#conformance)).
+0.1.1, not yet released (0.1.0 was tagged, never published). Every SDK-conformance fixture of the
+spec's agent-side sets passes; the host-guidance ones are skipped (see [Conformance](#conformance)).
 
 Not on crates.io yet. Depend on a checkout next to your project (the form mcpwarp-desktop uses),
 or on the git repository; the quick starts below also use these crates:
@@ -324,10 +324,18 @@ session existed is ignored by its `on_disconnected`.
 A `Session` assumes it is the only controller on its connection (one frame in flight, §2.6):
 replies are not matched by name, so any `registered`, `unregistered` or whole-frame `error` it is
 given answers its outstanding frame, and a `registered` that does not list its service makes it
-re-send. Several sessions on one connection are your job to serialize: let one session's
-`register`/`unregister` go out only once the previous frame on the connection is answered, and
-hand each reply to the session whose frame it answers, by frame order. `disable`, `enable` and
-`conflict` carry an id and name and can go to every session.
+re-send. Several sessions on one connection are your job to order, and the order is kept on the
+triggers, not the frames: a session marks a frame outstanding, records that it sent `register` on
+this connection, and starts the 2000 ms close budget for an `unregister` when it emits the
+`SendApp`, so hold back its triggers (`on_welcome`, any of its timer firings (transient retry or
+`OVERLOADED` re-send), an `enable`, `close()`) until the connection's slot is free and never
+buffer an emitted frame. A reply may make the session emit its next queued frame in the same
+call, which then holds the slot before any other session may send. Route `registered`,
+`unregistered` and a whole-frame `error` only to the session whose frame is on the wire, by frame
+order. Free the slot only on a reply, a `Disconnected` or a replacement welcome, never on a
+session's local state change, and key the queue by connection id across drains. `disable`,
+`enable` and `conflict` carry an id and name and can go to every session (an `enable` as a
+held-back trigger).
 
 A `conflict` is per service; a `drain{replaced}` is per connection. Tell them apart by the
 `SessionEvent::Conflict` reason (or by `on_drain` returning `true`):
@@ -408,8 +416,8 @@ MSRV: Rust 1.85 (edition 2024).
 
 ## Conformance
 
-The spec's agent-side fixtures (`spec/fixtures/mcpwarp`, MCPWARP.md §10) at v0.7.2. This SDK is
-the single-service profile, so the multi-service fixtures of §10.6 are skipped with a note:
+The spec's agent-side fixtures (`spec/fixtures/mcpwarp`, MCPWARP.md §10) at v0.8.0. The
+multi-service fixtures that §10.6 classifies as host guidance are skipped with a note:
 
 | Set | Result |
 |---|---|
@@ -438,10 +446,10 @@ anything outside the skips above.
   the previous one.
 - **TLS is a `TunnelOptions` / `ExposeConfig` setting** (`tls(ws_mixer::TlsConfig)`), the Rust
   form of §8's WebSocket factory; it does not change per `configure`.
-- **Single-service subset of the multi-service profile.** v0.7.2 has a multi-service profile
-  (§6A: one connection publishing many services, routed per stream by §4.8); this SDK implements
-  none of it, which the spec allows ("a single-service agent is a conforming subset of the
-  profile"). There is no service group and no `trust_server_id_header` (§4.8 Trust gate):
+- **One service per connection.** That is every SDK's scope; since v0.8.0 §6A (one connection
+  publishing many services, routed per stream by §4.8) is informative guidance for multi-service
+  hosts, which build their own controller. There is no service group and no
+  `trust_server_id_header` (§4.8 Trust gate: "An SDK does no routing ... and has no such option"):
   `X-Mcpwarp-Server-Id` and `X-Mcpwarp-Server-Name` reach the application as ordinary headers and
   never select anything. A single-service handle never selects by `Host` either: every `/mcp`
   request that reaches a registered handle goes to its handler, which answers `404` itself if it

@@ -9,10 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 The first release published to crates.io: 0.1.0 was tagged (`ws-mixer-mcpwarp-v0.1.0`) but never
 published, so the one source-breaking change below (`TunnelConfig::token_provider`) ships in a
-patch. Implements ws-mixer spec v0.7.2 (pin moved v0.6.1 -> v0.6.2 -> v0.7.0 -> v0.7.2, tag
-`389bae8`) as the single-service subset of its multi-service profile (§6A); ws-mixer-go pin
-v0.8.0 -> v0.9.0; depends on ws-mixer 0.2.1. Spec fixtures:
-envelope 68 (52 asserted, 14 edge-runner only, 2 multi-service skipped; 0.1.0: 60/46), bridging 22
+patch. Implements ws-mixer spec v0.8.0 (pin moved v0.6.1 -> v0.6.2 -> v0.7.0 -> v0.7.2 ->
+v0.8.0, tag `5962fec`) for one service per connection, every SDK's scope (§6A is host guidance);
+ws-mixer-go pin v0.8.0 -> v0.9.0; depends on ws-mixer 0.2.1. Spec fixtures:
+envelope 68 (52 asserted, 14 edge-runner only, 2 host-guidance skipped; 0.1.0: 60/46), bridging 22
 of 27 (0.1.0: 13 of 14), tunnel 44 of 58 with the 14 `ms_*` skipped (0.1.0: 34/34), status text
 144 table entries, 37 cases and the rules (0.1.0: 102, 26). Transport conformance: 25/25 client
 fixtures, 10/10 pair scenarios.
@@ -30,8 +30,8 @@ fixtures, 10/10 pair scenarios.
   rejection is `error`/`UNAUTHORIZED`.
 - `describe_service_status_raw(state, code, locale)` (§6A.9): one service's `service.<state>` label
   and its detail (`rejected`: the sentence for its register code; `disabled` with `DISABLED`: the
-  dashboard sentence), over wire strings and without overrides; the spec-shaped
-  `describe_service_status` (§9.2) is reserved for a multi-service controller. `describe_status` and
+  dashboard sentence), over wire strings and without overrides; a multi-service host builds its
+  own spec-shaped `describe_service_status` (§9.2) over it (§6A, informative). `describe_status` and
   `describe_status_raw` give `error`/`INTERNAL` with `lastError` `"No service could be
   registered."` the `lastError.NO_SERVICE_REGISTERED` detail.
 - `bridge::RequestInfo` and `ServeContext::state_for_request(Fn(&RequestInfo) -> ServeState)`:
@@ -67,7 +67,8 @@ fixtures, 10/10 pair scenarios.
   connection ended is ignored; `conflict` and `error` from it still apply, and a superseded
   connection's ops stay ignored. `Session::is_superseded` now stays `true` after a superseded
   connection ends (it was `false` once `on_disconnected` had run for it).
-- `Session` follows v0.7.2's frames-in-flight rules (§2.6 One in flight, §3.2):
+- `Session` follows the frames-in-flight rules (§2.6 One in flight, §3.2; v0.7.2, clarified in
+  v0.8.0):
   - `OVERLOADED` keeps its own counter: the re-send waits `min(1000 × 2^(n−1), 30000)` ms (was
     1000 ms every time; `on_retry` reports that delay). The counter resets on any reply that
     settles the outstanding frame and on every `welcome`.
@@ -101,8 +102,9 @@ fixtures, 10/10 pair scenarios.
     a whole-frame `error` or an empty `registered` still gets one (it was sent whenever a
     `register` had gone out).
   - `Session` assumes it is the only controller on its connection: replies are not matched by
-    name. A host running several sessions on one connection must serialize their frames and route
-    each reply to the session whose frame it answers, by frame order.
+    name. A host running several sessions on one connection must hold back each session's
+    triggers until the connection's slot is free and route each reply to the session whose frame
+    it answers, by frame order.
 - Request bridging: `CONNECT`, `TRACE` and `TRACK` (any case) are answered `400 request cannot be
   represented as a web Request` in handler and target mode alike (§4.5), the application not
   called.
@@ -125,13 +127,13 @@ fixtures, 10/10 pair scenarios.
 - `serde_json` stays built with `preserve_order`: `register` / `unregister` keep the spec's key
   order byte for byte, and ws-mixer's `send_app` takes a `serde_json::Value`. It is a feature of
   the host's whole dependency graph; the README says how to check.
-- Single-service subset of v0.7.2's multi-service profile (§6A): no service group. The envelope
-  fixtures `register_two_services` and `register_batch_valid` are skipped (the encoder sends one
-  service per frame), as are the bridging `multi_service_*` (4) and tunnel `ms_01`..`ms_14`
-  fixtures; the status-text multi-service entries are embedded and checked.
-- `trust_server_id_header` (§4.8) is not implemented: every request is served by the one exposed
-  service, never routed by `X-Mcpwarp-Server-Id` or `X-Mcpwarp-Server-Name`, which reach the
-  application as ordinary headers.
+- One service per connection, every SDK's scope; §6A is informative host guidance since v0.8.0:
+  no service group. The encode side of envelope `register_two_services` and
+  `register_batch_valid`, the bridging `multi_service_*` (4) and tunnel `ms_01`..`ms_14` are host
+  guidance (§10.6) and skipped; the status-text `hostOnly` entries are embedded and checked.
+- There is no `trust_server_id_header` (§4.8: an SDK does no routing and has no such option):
+  every request is served by the one exposed service, never routed by `X-Mcpwarp-Server-Id` or
+  `X-Mcpwarp-Server-Name`, which reach the application as ordinary headers.
 
 ## 0.1.0 (tagged `ws-mixer-mcpwarp-v0.1.0`, not published)
 

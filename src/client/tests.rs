@@ -744,6 +744,38 @@ async fn provider_panic_is_fatal() {
 // --- drain -------------------------------------------------------------------
 
 #[tokio::test(start_paused = true)]
+async fn frames_in_the_welcomes_write_are_delivered_after_connected() {
+    // CLIENT-SDK.md Handler delivery: an `app` and a `drain` received after
+    // `welcome` but before the connection is current are queued, not dropped.
+    let (_client, mut events, mut server) = start(builder());
+    let mut p = server.dial().await.accept().await;
+    let welcome = json!({
+        "t": "welcome", "v": 1, "session": "s-1", "window": 262_144,
+        "max_streams": 64, "ping_interval": HOUR, "ping_timeout": 3 * HOUR,
+    });
+    let app = json!({"t": "app", "body": {"early": true}});
+    let drain =
+        json!({"t": "drain", "reason": "rollout", "last_stream_id": 0, "deadline_ms": 30_000});
+    for v in [welcome, app, drain] {
+        let b = frame::encode_data(0, v.to_string().as_bytes());
+        p.ws.feed(Message::Binary(b)).await.unwrap();
+    }
+    p.ws.flush().await.unwrap();
+    assert_eq!(connected(&mut events).await.conn_id, ConnId(1));
+    match next(&mut events).await {
+        Event::App(a) => {
+            assert_eq!(a.conn_id, ConnId(1));
+            assert_eq!(Value::Object(a.body), json!({"early": true}));
+        }
+        other => panic!("expected App, got {other:?}"),
+    }
+    match next(&mut events).await {
+        Event::Drain(d) => assert_eq!(d.conn_id, ConnId(1)),
+        other => panic!("expected Drain, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn drain_dials_in_parallel_and_retires_the_old_connection_after_its_streams() {
     let (client, mut events, mut server) = start(builder());
     let mut p1 = server.dial().await.welcome().await;

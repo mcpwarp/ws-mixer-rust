@@ -258,10 +258,21 @@ pub enum Command {
 ///
 /// It keeps one `register`/`unregister` in flight (MCPWARP.md §2.6 Frames
 /// in flight) and assumes it is the only service on its connection: replies
-/// are not matched by name, so any `registered` or whole-frame `error` on
-/// the live connection answers its outstanding frame. A host multiplexing
-/// several sessions on one connection must serialize their frames and route
-/// each reply to the session whose frame it answers.
+/// are not matched by name, so any `registered`, `unregistered` or
+/// whole-frame `error` on the live connection answers its outstanding frame.
+/// A host multiplexing several sessions on one connection must hold back a
+/// session's triggers ([`on_welcome`](Self::on_welcome), any of its timer
+/// firings (transient retry or `OVERLOADED` re-send), an `enable`,
+/// [`close`](Self::close)) until the connection's slot is free, and never
+/// buffer an emitted [`Command::SendApp`]: emitting it marks the frame
+/// outstanding, records that it sent `register` on this connection, and for
+/// `unregister` starts the [`UNREGISTER_BUDGET`]. A reply may make the
+/// session emit its next queued frame in the same call, which then holds the
+/// slot before any other session may send. Route `registered`,
+/// `unregistered` and whole-frame `error` only to the session whose frame is
+/// on the wire; free the slot only on a reply, a disconnect or a replacement
+/// welcome, never on a session's local state change; key the queue by
+/// connection id across drains.
 #[derive(Debug)]
 pub struct Session {
     name: String,

@@ -38,8 +38,8 @@
 //! a `Redial{TokenRefresh}` with delay 0 (CLIENT-SDK.md's Rejected token
 //! row). `disconnect.flush_after` ops go out right after the `Disconnected`
 //! on the same channel, so post-disconnect delivery is supported. Group
-//! fixtures (`ms_*`, `config.services`) are skipped: this SDK has no
-//! multi-service controller. Skips print `skip: tunnel/<file>: <why>`, never
+//! fixtures (`ms_*`, `config.services`) are skipped: they are host guidance
+//! (MCPWARP.md §10.6), not SDK conformance. Skips print `skip: tunnel/<file>: <why>`, never
 //! `tunnel: skipped` (conformance.yml fails on that).
 #![cfg_attr(not(feature = "test-util"), allow(dead_code, unused_imports))]
 
@@ -52,9 +52,9 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-/// A floor on the fixtures run for the pinned spec (v0.7.2 has 58: 44
+/// A floor on the fixtures run for the pinned spec (v0.8.0 has 58: 44
 /// single-service ones, 01-32 and 34-45, all run, 07 without its
-/// unrepresentable config; the 14 `ms_*` group fixtures are skipped).
+/// unrepresentable config; the 14 `ms_*` host-guidance fixtures are skipped).
 const MIN_RUN: usize = 44;
 
 /// The `runnerRequirement`s this runner meets.
@@ -73,7 +73,7 @@ const FLUSHABLE: [&str; 6] = [
 /// Why this runner does not run `fx`, if it does not.
 fn skip_reason(fx: &Value) -> Option<String> {
     if fx["config"].get("services").is_some() {
-        return Some("multi-service profile not implemented (single-service SDK)".into());
+        return Some("host guidance (MCPWARP.md §10.6)".into());
     }
     match fx.get("runnerRequirement").and_then(Value::as_str) {
         Some(r) if !SUPPORTED_REQUIREMENTS.contains(&r) => Some(format!("runnerRequirement {r}")),
