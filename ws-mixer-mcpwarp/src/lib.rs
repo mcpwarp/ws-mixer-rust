@@ -5,7 +5,7 @@
 //! service with a `register` envelope after every `welcome`, and answers each
 //! stream the edge opens as one HTTP/1.1 request to `/mcp`.
 //!
-//! This release implements spec v0.8.0 for one service per connection, the
+//! This release implements spec v0.8.1 for one service per connection, the
 //! scope of every SDK (§6A, multi-service hosts, is informative guidance):
 //!
 //! - the envelope: [`encode_register`] / [`encode_unregister`] (byte-exact,
@@ -32,7 +32,7 @@
 //!   §6A being informative).
 //!
 //! [ws-mixer]: https://docs.rs/ws-mixer
-//! [MCPWARP.md]: https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.0/docs/MCPWARP.md
+//! [MCPWARP.md]: https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.1/docs/MCPWARP.md
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

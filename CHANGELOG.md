@@ -5,12 +5,18 @@ All notable changes to `ws-mixer` (the Rust client SDK for ws-mixer.v1) are docu
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.2.1 (unreleased)
+## 0.2.2 (unreleased)
 
-The first release published to crates.io: 0.2.0 was tagged (`ws-mixer-v0.2.0`) but never
-published. Implements the client role of ws-mixer spec v0.8.0; conformance 25/25 client fixtures
-(including the new `window_stale_retired_stream` sequence) and 10/10 pair scenarios against
-ws-mixer-go v0.9.0.
+### Changed
+
+- Pins spec v0.8.1 (tag `fedd389`), a docs-only spec release over v0.8.0: no behaviour change.
+
+## 0.2.1 (2026-10-24)
+
+Published to crates.io and tagged `ws-mixer-v0.2.1` at `1f66fe5`, the first release published
+there: 0.2.0 was tagged (`ws-mixer-v0.2.0`) but never published. Implements the client role of
+ws-mixer spec v0.8.0; conformance 25/25 client fixtures (including the new
+`window_stale_retired_stream` sequence) and 10/10 pair scenarios against ws-mixer-go v0.9.0.
 
 ### Changed
 

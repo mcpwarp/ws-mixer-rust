@@ -12,7 +12,7 @@
 //! ([`classify_close`]). Everything the application needs to react to arrives
 //! on the [`Events`] channel.
 //!
-//! This crate implements the client role of spec v0.8.0 and passes the spec
+//! This crate implements the client role of spec v0.8.1 and passes the spec
 //! runner's 25 client fixtures and its 10 pair scenarios against the
 //! ws-mixer-go v0.9.0 server.
 //!
@@ -158,7 +158,7 @@
 //! tokio only; [`ClientBuilder::connect`] must be called inside a tokio
 //! runtime. The minimum supported Rust version is 1.85 (edition 2024).
 //!
-//! [ws-mixer.v1]: https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.0/docs/WIRE.md
+//! [ws-mixer.v1]: https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.1/docs/WIRE.md
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

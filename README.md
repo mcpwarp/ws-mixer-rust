@@ -1,6 +1,6 @@
 # ws-mixer
 
-Rust client SDK for the [ws-mixer.v1](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.0/docs/WIRE.md)
+Rust client SDK for the [ws-mixer.v1](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.1/docs/WIRE.md)
 protocol: many independent, flow-controlled byte streams multiplexed over one WebSocket.
 
 The server opens streams; the client accepts each one as a `Stream` implementing tokio's
@@ -15,9 +15,10 @@ server side) and [ws-mixer-js](https://github.com/mcpwarp/ws-mixer-js) (Node cli
 
 ## Status
 
-0.2.1, not yet released; the first version to go to crates.io (0.2.0 was tagged, never
-published). Implements the client role of spec **v0.8.0** (`spec.pin`). The spec runner's
-conformance suite passes in full:
+0.2.1 on crates.io (2026-10-24), the first published version (0.2.0 was tagged, never
+published); ws-mixer-mcpwarp 0.1.1 was published with it. Both were built against spec v0.8.0;
+`main` pins spec **v0.8.1** (`spec.pin`, docs-only over v0.8.0) and implements its client role.
+The spec runner's conformance suite passes in full:
 
 - fixture mode: 25/25 client fixtures
 - pair mode: 10/10 scenarios with ws-mixer-go **v0.9.0** (`goserver.pin`) as the server
@@ -55,8 +56,8 @@ own (see [Releasing](#releasing)).
 ## mcpwarp layer
 
 [`ws-mixer-mcpwarp`](ws-mixer-mcpwarp/README.md) implements
-[MCPWARP.md](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.0/docs/MCPWARP.md) §2-§8 of spec
-v0.8.0 on this crate: expose a local MCP server at a public mcpwarp URL. It offers `expose()`
+[MCPWARP.md](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.1/docs/MCPWARP.md) §2-§8 of spec
+v0.8.1 on this crate: expose a local MCP server at a public mcpwarp URL. It offers `expose()`
 (one service, one call), `Tunnel` (a controller for apps with a settings UI, with status text in
 six locales) and the Tier 1 building blocks (envelope, codes, identity, the sans-IO registration
 machine, request bridging) for agents that run their own `ws_mixer::Client`. Its scope is one
@@ -68,16 +69,15 @@ text 144 table entries and 37 cases.
 
 ## Install
 
-Not on crates.io yet; depend on a checkout:
-
 ```toml
 [dependencies]
-ws-mixer = { path = "../ws-mixer-rust" }
+ws-mixer = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
 serde_json = "1"
 ```
 
-Once published: `ws-mixer = "0.2"`.
+For unreleased changes on `main`, depend on a checkout instead:
+`ws-mixer = { path = "../ws-mixer-rust" }`.
 
 ## Quick start
 
@@ -199,7 +199,7 @@ make conformance-pair      # spec runner, ws-mixer-go server x this client (need
 cargo deny check           # licenses, advisories, duplicate crates
 ```
 
-`make fetch-spec` and `make fetch-goserver` shallow-clone ws-mixer-spec at `spec.pin` (v0.8.0)
+`make fetch-spec` and `make fetch-goserver` shallow-clone ws-mixer-spec at `spec.pin` (v0.8.1)
 into `.spec/` and ws-mixer-go at `goserver.pin` (v0.9.0) into `.goserver/`, re-cloning when the
 pin changes; the conformance targets do this on their own. The spec fixture tests look in
 `$WSMIXER_SPEC_DIR`, then `.spec/` (ws-mixer also tries `../ws-mixer-spec`), and are skipped when
@@ -282,13 +282,17 @@ How a desktop host that exposes several local MCP servers should use the mcpwarp
 
 ## Releasing
 
-The two crates are versioned and tagged separately, with the crate name in the tag:
-`ws-mixer-v0.2.1` and `ws-mixer-mcpwarp-v0.1.1` (the earlier `ws-mixer-v0.2.0` and
-`ws-mixer-mcpwarp-v0.1.0` tags were never published). ws-mixer-mcpwarp depends on
+The two crates are versioned and tagged separately, with the crate name in the tag. The latest
+release is `ws-mixer-v0.2.1` and `ws-mixer-mcpwarp-v0.1.1` (2026-10-24, commit `1f66fe5`, both on
+crates.io; the earlier `ws-mixer-v0.2.0` and `ws-mixer-mcpwarp-v0.1.0` tags were never
+published); the next are 0.2.2 and 0.1.2. ws-mixer-mcpwarp depends on
 `ws-mixer = { path = "..", version = "0.2.1" }`, so ws-mixer goes first, and ws-mixer-mcpwarp's
-own `cargo publish --dry-run` resolves `ws-mixer` from crates.io and fails until 0.2.1 is there.
+own `cargo publish --dry-run` resolves `ws-mixer` from crates.io and fails until that version is
+there.
 
-From a clean `main` with CI green:
+From a clean `main` with CI green (the commands show the 0.2.1 / 0.1.1 release; bump `version` in
+both `Cargo.toml` files, and ws-mixer-mcpwarp's `ws-mixer` requirement when it needs the new
+ws-mixer, then substitute the new versions):
 
 ```sh
 # 1. Checks

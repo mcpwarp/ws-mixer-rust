@@ -5,9 +5,19 @@ All notable changes to `ws-mixer-mcpwarp` (the mcpwarp layer over ws-mixer) are 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.1.1 (unreleased)
+## 0.1.2 (unreleased)
 
-The first release published to crates.io: 0.1.0 was tagged (`ws-mixer-mcpwarp-v0.1.0`) but never
+### Changed
+
+- Spec pin v0.8.0 -> v0.8.1 (tag `fedd389`), docs-only: the clarifications it adds (a `welcome`
+  and close in the same burst allow a `Connected` before the disconnect, the stray-`registered`
+  clause names the `OVERLOADED` counter only, schema verdicts belong to the checker) were
+  already how this crate behaves. Fixture counts unchanged.
+
+## 0.1.1 (2026-10-24)
+
+Published to crates.io and tagged `ws-mixer-mcpwarp-v0.1.1` at `1f66fe5`, pinned to spec v0.8.0;
+the first release published there: 0.1.0 was tagged (`ws-mixer-mcpwarp-v0.1.0`) but never
 published, so the one source-breaking change below (`TunnelConfig::token_provider`) ships in a
 patch. Implements ws-mixer spec v0.8.0 (pin moved v0.6.1 -> v0.6.2 -> v0.7.0 -> v0.7.2 ->
 v0.8.0, tag `5962fec`) for one service per connection, every SDK's scope (§6A is host guidance);

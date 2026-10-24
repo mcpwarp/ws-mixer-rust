@@ -2,8 +2,8 @@
 
 The mcpwarp layer over [ws-mixer](https://github.com/mcpwarp/ws-mixer-rust): expose a local MCP
 server at a public mcpwarp URL. Implements §2-§8 of
-[`docs/MCPWARP.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.0/docs/MCPWARP.md) in
-ws-mixer-spec **v0.8.0**, on ws-mixer 0.2.1: one service per connection, the scope of every SDK
+[`docs/MCPWARP.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.1/docs/MCPWARP.md) in
+ws-mixer-spec **v0.8.1**, on ws-mixer 0.2.1: one service per connection, the scope of every SDK
 (§6A, multi-service hosts, is informative host guidance).
 
 An agent dials the edge with a `ws_mixer::Client`, sends a `register` envelope for its service
@@ -21,23 +21,25 @@ Native only (tokio). The registration machine is a port of
 
 ## Status
 
-0.1.1, not yet released (0.1.0 was tagged, never published). Every SDK-conformance fixture of the
-spec's agent-side sets passes; the host-guidance ones are skipped (see [Conformance](#conformance)).
+0.1.1 on crates.io (2026-10-24, on ws-mixer 0.2.1, built against spec v0.8.0; 0.1.0 was tagged,
+never published); `main` pins spec v0.8.1, docs-only over v0.8.0. Every SDK-conformance fixture
+of the spec's agent-side sets passes; the host-guidance ones are skipped (see
+[Conformance](#conformance)).
 
-Not on crates.io yet. Depend on a checkout next to your project (the form mcpwarp-desktop uses),
-or on the git repository; the quick starts below also use these crates:
+The quick starts below also use these crates:
 
 ```toml
 [dependencies]
-ws-mixer-mcpwarp = { path = "../ws-mixer-rust/ws-mixer-mcpwarp" }
-# or: ws-mixer-mcpwarp = { git = "https://github.com/mcpwarp/ws-mixer-rust" }
+ws-mixer-mcpwarp = "0.1"
 bytes = "1"
 http = "1"
 http-body-util = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 
-Once published: `ws-mixer-mcpwarp = "0.1"`.
+For unreleased changes on `main`, depend on a checkout next to your project (the form
+mcpwarp-desktop uses), `ws-mixer-mcpwarp = { path = "../ws-mixer-rust/ws-mixer-mcpwarp" }`, or
+on the git repository, `ws-mixer-mcpwarp = { git = "https://github.com/mcpwarp/ws-mixer-rust" }`.
 
 ## Quick start: `expose()`
 
@@ -416,7 +418,7 @@ MSRV: Rust 1.85 (edition 2024).
 
 ## Conformance
 
-The spec's agent-side fixtures (`spec/fixtures/mcpwarp`, MCPWARP.md §10) at v0.8.0. The
+The spec's agent-side fixtures (`spec/fixtures/mcpwarp`, MCPWARP.md §10) at v0.8.1. The
 multi-service fixtures that §10.6 classifies as host guidance are skipped with a note:
 
 | Set | Result |
