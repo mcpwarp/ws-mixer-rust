@@ -10,6 +10,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Pins spec v0.8.1 (tag `fedd389`), a docs-only spec release over v0.8.0: no behaviour change.
+- Spec pin v0.8.1 -> v0.8.3 (tag `a065159`). v0.8.2 and v0.8.3 are docs-only (no rule or
+  fixture change): no behaviour change, conformance counts unchanged.
 
 ## 0.2.1 (2026-10-24)
 

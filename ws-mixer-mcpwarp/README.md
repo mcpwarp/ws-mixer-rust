@@ -2,8 +2,8 @@
 
 The mcpwarp layer over [ws-mixer](https://github.com/mcpwarp/ws-mixer-rust): expose a local MCP
 server at a public mcpwarp URL. Implements §2-§8 of
-[`docs/MCPWARP.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.1/docs/MCPWARP.md) in
-ws-mixer-spec **v0.8.1**, on ws-mixer 0.2.1: one service per connection, the scope of every SDK
+[`docs/MCPWARP.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.3/docs/MCPWARP.md) in
+ws-mixer-spec **v0.8.3**, on ws-mixer 0.2.1: one service per connection, the scope of every SDK
 (§6A, multi-service hosts, is informative host guidance).
 
 An agent dials the edge with a `ws_mixer::Client`, sends a `register` envelope for its service
@@ -22,7 +22,7 @@ Native only (tokio). The registration machine is a port of
 ## Status
 
 0.1.1 on crates.io (2026-10-24, on ws-mixer 0.2.1, built against spec v0.8.0; 0.1.0 was tagged,
-never published); `main` pins spec v0.8.1, docs-only over v0.8.0. Every SDK-conformance fixture
+never published); `main` pins spec v0.8.3, docs-only over v0.8.0. Every SDK-conformance fixture
 of the spec's agent-side sets passes; the host-guidance ones are skipped (see
 [Conformance](#conformance)).
 
@@ -418,7 +418,7 @@ MSRV: Rust 1.85 (edition 2024).
 
 ## Conformance
 
-The spec's agent-side fixtures (`spec/fixtures/mcpwarp`, MCPWARP.md §10) at v0.8.1. The
+The spec's agent-side fixtures (`spec/fixtures/mcpwarp`, MCPWARP.md §10) at v0.8.3. The
 multi-service fixtures that §10.6 classifies as host guidance are skipped with a note:
 
 | Set | Result |

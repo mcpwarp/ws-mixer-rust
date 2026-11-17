@@ -1,6 +1,6 @@
 # ws-mixer
 
-Rust client SDK for the [ws-mixer.v1](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.1/docs/WIRE.md)
+Rust client SDK for the [ws-mixer.v1](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.3/docs/WIRE.md)
 protocol: many independent, flow-controlled byte streams multiplexed over one WebSocket.
 
 The server opens streams; the client accepts each one as a `Stream` implementing tokio's
@@ -17,7 +17,7 @@ server side) and [ws-mixer-js](https://github.com/mcpwarp/ws-mixer-js) (Node cli
 
 0.2.1 on crates.io (2026-10-24), the first published version (0.2.0 was tagged, never
 published); ws-mixer-mcpwarp 0.1.1 was published with it. Both were built against spec v0.8.0;
-`main` pins spec **v0.8.1** (`spec.pin`, docs-only over v0.8.0) and implements its client role.
+`main` pins spec **v0.8.3** (`spec.pin`, docs-only over v0.8.0) and implements its client role.
 The spec runner's conformance suite passes in full:
 
 - fixture mode: 25/25 client fixtures
@@ -56,8 +56,8 @@ own (see [Releasing](#releasing)).
 ## mcpwarp layer
 
 [`ws-mixer-mcpwarp`](ws-mixer-mcpwarp/README.md) implements
-[MCPWARP.md](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.1/docs/MCPWARP.md) §2-§8 of spec
-v0.8.1 on this crate: expose a local MCP server at a public mcpwarp URL. It offers `expose()`
+[MCPWARP.md](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.3/docs/MCPWARP.md) §2-§8 of spec
+v0.8.3 on this crate: expose a local MCP server at a public mcpwarp URL. It offers `expose()`
 (one service, one call), `Tunnel` (a controller for apps with a settings UI, with status text in
 six locales) and the Tier 1 building blocks (envelope, codes, identity, the sans-IO registration
 machine, request bridging) for agents that run their own `ws_mixer::Client`. Its scope is one
@@ -199,7 +199,7 @@ make conformance-pair      # spec runner, ws-mixer-go server x this client (need
 cargo deny check           # licenses, advisories, duplicate crates
 ```
 
-`make fetch-spec` and `make fetch-goserver` shallow-clone ws-mixer-spec at `spec.pin` (v0.8.1)
+`make fetch-spec` and `make fetch-goserver` shallow-clone ws-mixer-spec at `spec.pin` (v0.8.3)
 into `.spec/` and ws-mixer-go at `goserver.pin` (v0.9.0) into `.goserver/`, re-cloning when the
 pin changes; the conformance targets do this on their own. The spec fixture tests look in
 `$WSMIXER_SPEC_DIR`, then `.spec/` (ws-mixer also tries `../ws-mixer-spec`), and are skipped when

@@ -13,6 +13,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and close in the same burst allow a `Connected` before the disconnect, the stray-`registered`
   clause names the `OVERLOADED` counter only, schema verdicts belong to the checker) were
   already how this crate behaves. Fixture counts unchanged.
+- Spec pin v0.8.1 -> v0.8.3 (tag `a065159`). v0.8.2 and v0.8.3 are docs-only (no rule or
+  fixture change): the new MCP 2026-07-28 request example in §4.1 and the informative §4.7 note
+  need nothing from this crate. Fixture counts unchanged.
 
 ## 0.1.1 (2026-10-24)
 
